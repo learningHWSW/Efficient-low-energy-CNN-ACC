@@ -1,0 +1,25 @@
+# Build outputs (Vitis HLS work dirs, compiled testbenches)
+build/
+proj_magnet/
+*.exe
+*.o
+
+# Vitis / Vivado logs and junk
+*.log
+*.jou
+.Xil/
+vitis_hls.log
+v++*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Windows / OneDrive
+desktop.ini
+Thumbs.db
+
+# Reference material — copyrighted publisher PDFs plus third-party repos
+# (buffets, MatchLib, IPA, ...) downloaded for study. Kept local only;
+# remove this line if you want them under version control in a private repo.
+resources/
