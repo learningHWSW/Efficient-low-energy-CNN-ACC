@@ -106,8 +106,8 @@ static oa_t requantize(acc_t acc, int mult, int shift, bool relu) {
         x += ((wide_t)1 << (shift - 1));
     x >>= shift;
     if (relu && x < 0) x = 0;
-    if (x > 127)  x = 127;
-    if (x < -128) x = -128;
+    if (x > OA_MAX) x = OA_MAX;
+    if (x < OA_MIN) x = OA_MIN;
     return (oa_t)x;
 }
 

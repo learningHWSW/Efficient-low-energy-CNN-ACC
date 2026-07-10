@@ -41,8 +41,14 @@ struct Tensor {
         return reinterpret_cast<const oavec_t *>(data.data());
     }
 };
-static_assert(sizeof(iavec_t) == sizeof(oavec_t),
-              "IA/OA word layout must match for layer chaining");
+// Layer chaining relies on byte-identical layouts: OA words (N_LANES x
+// OA_BITS) and IA words (VECTOR_SIZE x IA_BITS) tile the same channel-major
+// byte stream. Requires equal element precision; word sizes may differ
+// (int4: OA word 32b, IA word 64b).
+static_assert(IA_BITS == OA_BITS,
+              "IA/OA element precision must match for layer chaining");
+static_assert((VECTOR_SIZE * IA_BITS) % (N_LANES * OA_BITS) == 0,
+              "IA word must be a whole number of OA words");
 
 struct ConvParams {
     int K = 0, R = 1, S = 1, stride = 1, pad = 0;
@@ -122,7 +128,12 @@ inline void run_conv(const Tensor &in, const ConvParams &cp, Tensor &out) {
     assert((int)cp.w.size() == K1 * N_LANES * cp.R * cp.S * in.C1);
     assert((int)cp.bias.size() == K1 * N_LANES);
 
-    out.alloc(P, Q, K1);
+    // Output tensor size in IA words: same byte stream as K1 OA words per
+    // pixel (int8: c1_out == K1; int4: half as many 64b words)
+    assert((cp.K % VECTOR_SIZE) == 0 &&
+           "K must be a VECTOR_SIZE multiple for chaining");
+    const int c1_out = cp.K / VECTOR_SIZE;
+    out.alloc(P, Q, c1_out);
     // the four IA pointers alias the same buffer (multi-port loader)
     magnet_top(in.data.data(), in.data.data(), in.data.data(), in.data.data(),
                cp.w.data(), out.as_oa(), cp.bias.data(),
@@ -131,12 +142,19 @@ inline void run_conv(const Tensor &in, const ConvParams &cp, Tensor &out) {
                cp.mult, cp.shift, cp.relu);
 }
 
+// Global PE indexes buffers in OA words; convert the tensor's IA-word count
+// (int8: x1, int4: x2)
+inline int oa_words_per_pixel(const Tensor &t) {
+    return t.C1 * (VECTOR_SIZE * IA_BITS) / (N_LANES * OA_BITS);
+}
+
 inline void run_eltwise(const Tensor &a, const Tensor &b, Tensor &out,
                         int multA, int multB, int shift, int relu) {
     assert(a.H == b.H && a.W == b.W && a.C1 == b.C1);
     out.alloc(a.H, a.W, a.C1);
+    const int c1w = oa_words_per_pixel(a);
     global_pe_top(a.as_oa(), b.as_oa(), out.as_oa(), GPE_ELTWISE,
-                  a.H, a.W, a.C1, 1, 1, 1, 0, multA, multB, shift, relu);
+                  a.H, a.W, c1w, 1, 1, 1, 0, multA, multB, shift, relu);
 }
 
 inline void run_pool(const Tensor &in, Tensor &out, int mode,
@@ -145,8 +163,9 @@ inline void run_pool(const Tensor &in, Tensor &out, int mode,
     const int P = (in.H + 2 * pad - R) / stride + 1;
     const int Q = (in.W + 2 * pad - S) / stride + 1;
     out.alloc(P, Q, in.C1);
+    const int c1w = oa_words_per_pixel(in);
     global_pe_top(in.as_oa(), in.as_oa(), out.as_oa(), mode,
-                  in.H, in.W, in.C1, R, S, stride, pad, multA, 0, shift, 0);
+                  in.H, in.W, c1w, R, S, stride, pad, multA, 0, shift, 0);
 }
 
 } // namespace nr

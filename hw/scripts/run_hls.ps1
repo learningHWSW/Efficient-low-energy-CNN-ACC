@@ -6,6 +6,10 @@
 #   .\hw\scripts\run_hls.ps1 synth      # conv kernel C synthesis
 #   .\hw\scripts\run_hls.ps1 cosim      # conv kernel RTL co-simulation
 #                                       # (reduced TB; synthesizes first)
+#   .\hw\scripts\run_hls.ps1 pe16-csim  # 16-PE config csim (zu9eg license req.)
+#   .\hw\scripts\run_hls.ps1 pe16-synth # 16-PE config synthesis
+#   .\hw\scripts\run_hls.ps1 int4-csim  # conv kernel csim, int4 config
+#   .\hw\scripts\run_hls.ps1 int4-synth # conv kernel synthesis, int4 config
 #   .\hw\scripts\run_hls.ps1 gpe-csim   # Global PE C simulation
 #   .\hw\scripts\run_hls.ps1 gpe-synth  # Global PE C synthesis
 #   .\hw\scripts\run_hls.ps1 gcc        # run conv TB with bundled g++ (no license)
@@ -38,6 +42,23 @@ switch ($Mode) {
             & "$XILINX\Vitis\bin\vitis-run.bat" --mode hls --cosim `
                 --config hw/scripts/hls_config_cosim.cfg --work_dir build/hls_cosim
         }
+    }
+    "pe16-csim" {
+        # 16-PE config (zu9eg target — needs an Enterprise-tier license)
+        & "$XILINX\Vitis\bin\vitis-run.bat" --mode hls --csim `
+            --config hw/scripts/hls_config_pe16.cfg --work_dir build/hls_pe16
+    }
+    "pe16-synth" {
+        & "$XILINX\Vitis\bin\v++.bat" -c --mode hls `
+            --config hw/scripts/hls_config_pe16.cfg --work_dir build/hls_pe16
+    }
+    "int4-csim" {
+        & "$XILINX\Vitis\bin\vitis-run.bat" --mode hls --csim `
+            --config hw/scripts/hls_config_int4.cfg --work_dir build/hls_int4
+    }
+    "int4-synth" {
+        & "$XILINX\Vitis\bin\v++.bat" -c --mode hls `
+            --config hw/scripts/hls_config_int4.cfg --work_dir build/hls_int4
     }
     "gpe-csim" {
         & "$XILINX\Vitis\bin\vitis-run.bat" --mode hls --csim `

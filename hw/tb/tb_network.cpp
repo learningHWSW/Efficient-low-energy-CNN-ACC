@@ -27,8 +27,8 @@ static int8_t g_requant(int64_t x, int mult, int shift, bool relu) {
     if (shift > 0) x += ((int64_t)1 << (shift - 1));
     x >>= shift;
     if (relu && x < 0) x = 0;
-    if (x > 127) x = 127;
-    if (x < -128) x = -128;
+    if (x > OA_MAX) x = OA_MAX;
+    if (x < OA_MIN) x = OA_MIN;
     return (int8_t)x;
 }
 
@@ -55,7 +55,8 @@ static std::vector<int8_t> g_conv(const std::vector<int8_t> &in, int H, int W,
                             acc += (int32_t)w[((k * R + r) * S + s) * C + c] *
                                    (int32_t)in[(ih * W + iw) * C + c];
                     }
-                out[(p * Q + q) * K + k] = g_requant(acc, mult, shift, relu != 0);
+                out[(p * Q + q) * K + k] =
+                    g_requant(acc, mult, shift + SHIFT_DELTA, relu != 0);
             }
     P_out = P; Q_out = Q;
     return out;
@@ -93,16 +94,16 @@ static nr::ConvParams make_conv(std::mt19937 &rng, int C, int K, int R, int S,
                                 int stride, int pad, int mult, int shift,
                                 int relu, std::vector<int8_t> &w_raw,
                                 std::vector<int32_t> &b_raw) {
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> dw(W_RMIN, W_RMAX);
     std::uniform_int_distribution<int> db(-1000, 1000);
     w_raw.resize((size_t)K * R * S * C);
     b_raw.assign(K, 0);
-    for (auto &v : w_raw) v = (int8_t)d8(rng);
+    for (auto &v : w_raw) v = (int8_t)dw(rng);
     for (auto &v : b_raw) v = db(rng);
 
     nr::ConvParams cp;
     cp.K = K; cp.R = R; cp.S = S; cp.stride = stride; cp.pad = pad;
-    cp.mult = mult; cp.shift = shift; cp.relu = relu;
+    cp.mult = mult; cp.shift = shift + SHIFT_DELTA; cp.relu = relu;
     const int C1 = C / VECTOR_SIZE;
     const int K1 = (K + N_LANES - 1) / N_LANES;
     cp.w.assign((size_t)K1 * N_LANES * R * S * C1, wvec_t());
@@ -122,7 +123,7 @@ static nr::ConvParams make_conv(std::mt19937 &rng, int C, int K, int R, int S,
 
 int main() {
     std::mt19937 rng(20260709);
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> d8(IA_RMIN, IA_RMAX);
     int e = 0;
 
     // ---- input x: 16x16x32 ----
@@ -167,7 +168,7 @@ int main() {
         if (sh > 0) v += (int64_t)1 << (sh - 1);
         v >>= sh;
         if (v < 0) v = 0;
-        if (v > 127) v = 127;
+        if (v > OA_MAX) v = OA_MAX;
         gE[i] = (int8_t)v;
     }
     nr::Tensor tE;
@@ -180,7 +181,7 @@ int main() {
     for (int p = 0; p < PP; ++p)
         for (int q = 0; q < PP; ++q)
             for (int c = 0; c < C; ++c) {
-                int mx = -128;
+                int mx = OA_MIN;
                 for (int r = 0; r < 3; ++r)
                     for (int s = 0; s < 3; ++s) {
                         const int ih = p * 2 - 1 + r, iw = q * 2 - 1 + s;
@@ -202,8 +203,8 @@ int main() {
         sum *= 512;
         sum += (int64_t)1 << 14;
         sum >>= 15;
-        if (sum > 127) sum = 127;
-        if (sum < -128) sum = -128;
+        if (sum > OA_MAX) sum = OA_MAX;
+        if (sum < OA_MIN) sum = OA_MIN;
         gA[c] = (int8_t)sum;
     }
     nr::Tensor tA;

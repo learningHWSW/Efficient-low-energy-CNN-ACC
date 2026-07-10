@@ -204,13 +204,31 @@ k1 타일 루프:
 | **—** | cosim (RTL 시뮬레이션, 축소 TB 9런) | ✅ PASS (데드락 없음 확인) |
 | **4a** | **8 PE 확장** (512 MAC/cycle, ZU7EV 타깃) + gather (q,kp) flatten 재설계(N_PES 증가에도 리소스 평평) + XRT 호스트/링크 설정 딜리버러블 | ✅ |
 | **4c** | **멀티포트 IA 로더**(4포트, C-split 최대 4×) + **ResNet-50 전체 네트워크**(실크기 dry-run 53 conv + 축소 e2e 16블록) + **Tuner-lite**(sw/tuner/tuner.py, 설계공간 탐색) | ✅ |
+| **5** | **INT4 데이터패스**(-DUSE_INT4): W/IA/OA=4b, VECTOR_SIZE 8→16 → PE당 128 MAC/cycle(1024 total). 정밀도 매크로 일반화, 레이어 체이닝 word 계산 일반화 | ✅ (csim + int8/int4 회귀 PASS) |
 | **4b** | 보드 실행: 플랫폼 설치 → v++ 링크(system.cfg) → XRT 호스트 실기 검증 | 보드/플랫폼 필요 |
-| **—** | INT4 데이터패스(W/IA_BITS=4), Q>128 지원(W 타일링) | 향후 |
+| **—** | Q>128 지원(W 타일링), per-vector 스케일(4b) | 향후 |
 
-**16 PE 관련**: 알고리즘은 N_PES=16으로 레퍼런스 모델 24/24 검증 완료.
-합성은 zu9eg(ZCU102)급이 필요한데 무료 BASIC 라이선스가 zu9eg를 커버하지
-않아 8 PE(zu7ev)를 합성 타깃으로 선택. 대학/기업 라이선스가 있으면
-`N_PES=16` + `part=xczu9eg-ffvb1156-2-e` 두 줄 변경으로 확장된다.
+### INT4 구성 (Phase 5)
+
+MAGNet의 대표 기능(4-bit로 성능/면적 개선)을 컴파일 스위치로 구현:
+- `-DUSE_INT4`: W_BITS/IA_BITS/OA_BITS=4, **VECTOR_SIZE 8→16**. 64b 메모리
+  word가 16개 요소를 담아 PE당 처리량 2배(128 MAC/cycle) → **1024 MAC/cycle
+  = 409.6 GOPS @ 200MHz**.
+- **DSP packing은 4-bit에서도 그대로 성립**: `(w1≪18+w0)·a`에서 |w0·a| ≤ 8·8
+  = 64 ≪ 2^17 이므로 borrow 보정 증명 불변. VECTOR_SIZE만 늘어 DOT2가 16회.
+- 포화 한계(OA_MAX/MIN)와 TB 값 범위(IA_RMAX 등)를 정밀도 매크로로 일반화.
+- **레이어 체이닝**: int4에서 OA word(8×4b=32b) ≠ IA word(16×4b=64b)이지만
+  바이트 스트림은 동일 — net_runner가 word 수를 `VECTOR_SIZE·IA_BITS /
+  (N_LANES·OA_BITS)` 비율로 환산(int8 ×1, int4 ×2). K는 VECTOR_SIZE 배수 요구.
+- 매퍼 추정 ResNet-50: int8 20.3ms → **int4 11.8ms**(고유 shape 1회 기준).
+
+**16 PE 구성**: `N_PES`는 빌드 스위치(-DN_PES=16, `hls_config_pe16.cfg`).
+기능 검증 완료 — 레퍼런스 모델 24/24 + g++ TB 36케이스(int8/int4 각각).
+구조 합성도 확인됨(II=1, violation 없음 — zu7ev 파트로 스케줄 검증; 리소스는
+초과). **실사용은 zu9eg(ZCU102)급 + Enterprise 라이선스 필요** (무료 BASIC은
+zu9eg 미지원, zu7ev는 BRAM 물리 부족). `mapper.py --pes 16 [--int4]`,
+`run_hls.ps1 pe16-csim|pe16-synth`. 매퍼 추정(고유 shape 1회): 16 PE int8
+13.4ms, int4 8.7ms.
 
 ### 참고 문헌 (resources/)
 - MAGNet: A Modular Accelerator Generator for Neural Networks — ICCAD 2019

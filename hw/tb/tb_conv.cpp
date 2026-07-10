@@ -32,8 +32,8 @@ static int8_t golden_requant(int32_t acc, int mult, int shift, bool relu) {
         x += ((int64_t)1 << (shift - 1));
     x >>= shift;
     if (relu && x < 0) x = 0;
-    if (x > 127)  x = 127;
-    if (x < -128) x = -128;
+    if (x > OA_MAX) x = OA_MAX;
+    if (x < OA_MIN) x = OA_MIN;
     return (int8_t)x;
 }
 
@@ -53,8 +53,10 @@ static int run_test(const TestCase &tc, int KP, int CP, unsigned seed) {
            tc.pad, C1, CT1, P, Q);
 
     std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> dia(IA_RMIN, IA_RMAX);
+    std::uniform_int_distribution<int> dw(W_RMIN, W_RMAX);
     std::uniform_int_distribution<int> db(-1000, 1000);
+    const int shift = tc.shift + SHIFT_DELTA;  // int4 products shrink
 
     // ---- host arrays ----
     std::vector<int8_t> ia(tc.H * tc.W * tc.C);
@@ -64,8 +66,8 @@ static int run_test(const TestCase &tc, int KP, int CP, unsigned seed) {
 #else
     std::vector<int32_t> bias(Kp, 0);
 #endif
-    for (auto &v : ia) v = (int8_t)d8(rng);
-    for (auto &v : w)  v = (int8_t)d8(rng);
+    for (auto &v : ia) v = (int8_t)dia(rng);
+    for (auto &v : w)  v = (int8_t)dw(rng);
     for (int k = 0; k < tc.K; ++k) bias[k] = db(rng);
 
     // ---- device arrays (NHWC / KRSC; C1 zero-padded to CP*VECTOR_SIZE) ----
@@ -118,14 +120,14 @@ static int run_test(const TestCase &tc, int KP, int CP, unsigned seed) {
                                    (int32_t)ia[(ih * tc.W + iw) * tc.C + c];
                     }
                 gold[(p * Q + q) * tc.K + k] =
-                    golden_requant(acc, tc.mult, tc.shift, tc.relu != 0);
+                    golden_requant(acc, tc.mult, shift, tc.relu != 0);
             }
 
     // ---- run DUT (the four IA pointers alias the same buffer) ----
     magnet_top(d_ia.data(), d_ia.data(), d_ia.data(), d_ia.data(),
                d_w.data(), d_oa.data(), bias.data(),
                tc.H, tc.W, C1, K1, tc.K, P, Q, tc.R, tc.S,
-               tc.stride, tc.pad, CT1, KP, CP, tc.mult, tc.shift, tc.relu);
+               tc.stride, tc.pad, CT1, KP, CP, tc.mult, shift, tc.relu);
 
     // ---- compare ----
     int errors = 0;

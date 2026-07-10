@@ -12,6 +12,9 @@ NVIDIA **MAGNet** (ICCAD 2019) 논문의 모듈형 가속기 템플릿을 AMD Vi
 - ✅ **런타임 spatial 매핑** KP×CP: K-split(8×1)/혼합(4×2)/C-split(1×8),
   mapper가 레이어별 자동 선택. gather는 (q,kp) flatten II=1 구조라
   N_PES를 키워도 리소스가 늘지 않음
+- ✅ **16 PE 구성** (`-DN_PES=16`, `hls_config_pe16.cfg`): 기능 검증 완료
+  (g++ int8/int4 각 36케이스) + 구조 합성 확인. **zu9eg(ZCU102)급 +
+  Enterprise 라이선스 필요** (zu7ev는 BRAM 초과). `mapper.py --pes 16`
 - ✅ PE 내부: OS-LWS 데이터플로우, C-타일링, DSP packing(2MAC/DSP, 전수 검증)
 - ✅ **Vitis 2026.1 csim 통과**: 12 레이어 × 3 spatial = 36 케이스 골든 일치.
   16 PE 구성도 알고리즘 검증 완료(모델 24/24) — zu9eg + Enterprise 라이선스
@@ -25,6 +28,10 @@ NVIDIA **MAGNet** (ICCAD 2019) 논문의 모듈형 가속기 템플릿을 AMD Vi
   bottleneck 블록 e2e 비트 일치 (`run_hls.ps1 resnet`)
 - ✅ **Tuner-lite** (`sw/tuner/tuner.py`): 설계공간 탐색 — 현재 구성(8 PE,
   wbuf 256, qmax 128)이 zu7ev에서 Pareto 최적임을 확인
+- ✅ **INT4 구성** (`-DUSE_INT4`): W/IA/OA 4-bit + VECTOR_SIZE 16 → **1024
+  MAC/cycle = 409.6 GOPS**. int8/int4 양쪽 회귀 PASS(g++ + Vitis csim),
+  ResNet-50 추정 int8 20ms → int4 12ms. `run_hls.ps1 int4-csim|int4-synth`,
+  `mapper.py --int4`
 - ✅ **XRT 호스트/링크 딜리버러블**: `sw/host/xrt_host.cpp` + `hw/scripts/system.cfg`
   (보드·플랫폼 미보유로 실기 검증은 보류 — Phase 4b)
 - ℹ 제약: Q ≤ 128 (ResNet-50 전 레이어 커버; VGG-224급은 W 타일링 필요),

@@ -28,8 +28,8 @@ static int8_t g_sat(int64_t x, int shift, bool relu) {
     if (shift > 0) x += ((int64_t)1 << (shift - 1));
     x >>= shift;
     if (relu && x < 0) x = 0;
-    if (x > 127) x = 127;
-    if (x < -128) x = -128;
+    if (x > OA_MAX) x = OA_MAX;
+    if (x < OA_MIN) x = OA_MIN;
     return (int8_t)x;
 }
 
@@ -77,7 +77,7 @@ static std::vector<int8_t> g_maxpool(const std::vector<int8_t> &in, int H,
     for (int p = 0; p < P; ++p)
         for (int q = 0; q < Q; ++q)
             for (int c = 0; c < C; ++c) {
-                int mx = -128;
+                int mx = OA_MIN;
                 for (int r = 0; r < R; ++r)
                     for (int s = 0; s < S; ++s) {
                         const int ih = p * stride - pad + r;
@@ -122,8 +122,10 @@ static int compare(const char *name, const nr::Tensor &t,
 }
 
 // heuristic requant shift keeping activations lively through a deep chain
+// (SHIFT_DELTA compensates for the smaller products at lower precision)
 static int conv_shift(int C, int R, int S) {
-    return 9 + (int)std::round(std::log2(std::sqrt((double)C * R * S)));
+    return 9 + SHIFT_DELTA +
+           (int)std::round(std::log2(std::sqrt((double)C * R * S)));
 }
 
 // random conv params (device packing) + golden weight copy
@@ -131,7 +133,7 @@ static nr::ConvParams make_conv(std::mt19937 &rng, int C, int K, int R, int S,
                                 int stride, int pad, int relu,
                                 std::vector<int8_t> &w_raw,
                                 std::vector<int32_t> &b_raw) {
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> d8(W_RMIN, W_RMAX);
     std::uniform_int_distribution<int> db(-1000, 1000);
     w_raw.resize((size_t)K * R * S * C);
     b_raw.assign(K, 0);
@@ -243,13 +245,13 @@ static int dry_run() {
 static int e2e() {
     printf("=== Part 2: reduced-size ResNet-50 e2e (32x32, real channels) ===\n");
     std::mt19937 rng(20260710);
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> d8(IA_RMIN, IA_RMAX);
     int e = 0;
 
-    // input 32x32x8 (3 real channels padded to 8 by the host contract; here
-    // we simply use 8 dense channels)
+    // input 32x32xVECTOR_SIZE (real ResNet input is 3 channels padded up to
+    // a memory word; use VECTOR_SIZE dense channels — 8 int8 / 16 int4)
     int H = 32, W = 32;
-    int C = 8;
+    int C = VECTOR_SIZE;
     std::vector<int8_t> gold((size_t)H * W * C);
     for (auto &v : gold) v = (int8_t)d8(rng);
     nr::Tensor t = to_tensor(gold, H, W, C);

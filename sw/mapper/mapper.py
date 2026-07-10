@@ -23,7 +23,7 @@ from dataclasses import dataclass, asdict
 # --- hardware design-time parameters (must match hw/include/accel_config.h) --
 @dataclass
 class HwConfig:
-    vector_size: int = 8
+    vector_size: int = 8   # 8 for int8, 16 for int4 (64b word / precision)
     n_lanes: int = 8
     n_pes: int = 8         # number of PEs (KP*CP == n_pes, matches N_PES)
     wbuf_depth: int = 256
@@ -192,9 +192,14 @@ def main():
     ap.add_argument("--network", choices=NETWORKS.keys())
     ap.add_argument("--json", help="save results to a JSON file")
     ap.add_argument("--freq", type=float, default=200.0, help="clock (MHz)")
+    ap.add_argument("--int4", action="store_true",
+                    help="int4 config (VECTOR_SIZE=16, 2x throughput)")
+    ap.add_argument("--pes", type=int, default=8,
+                    help="number of PEs (N_PES; 16 needs a zu9eg-class device)")
     args = ap.parse_args()
 
-    hw = HwConfig(freq_mhz=args.freq)
+    hw = HwConfig(freq_mhz=args.freq, n_pes=args.pes,
+                  vector_size=16 if args.int4 else 8)
     layers = []
     if args.layer:
         v = [int(x) for x in args.layer.split(",")]

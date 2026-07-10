@@ -17,22 +17,48 @@
 // =============================================================================
 #pragma once
 
-// ---- Compute hierarchy ------------------------------------------------------
+// ---- Precision configuration (MAGNet W/IA/AccumPrecision) --------------------
+// Default build is int8. Compile with -DUSE_INT4 for the 4-bit configuration:
+// the 64b memory word then carries 16 elements, doubling VECTOR_SIZE and the
+// per-PE throughput (MAGNet's headline precision/efficiency trade-off).
+#ifdef USE_INT4
+#define VECTOR_SIZE   16   // dot-product width  (input-channel unroll)
+#else
 #define VECTOR_SIZE   8    // dot-product width  (input-channel unroll)
+#endif
 #define N_LANES       8    // vector MACs per PE (output-channel unroll)
-#define N_PES         8    // PE array (Phase 4). Runtime spatial mapping KP*CP = N_PES.
-                           // 8 fits zu7ev/ZCU104 (covered by the free license tier).
-                           // 16 (Simba chiplet class) needs zu9eg/ZCU102 or larger —
-                           // the algorithm is verified up to 16 PEs
-                           // (reference_model with N_PES=16).
+// PE array size. Runtime spatial mapping KP*CP = N_PES. Overridable at build
+// time (-DN_PES=16, see hls_config_pe16.cfg):
+//   8  = default, fits zu7ev/ZCU104 (free license tier)
+//   16 = Simba chiplet class, needs zu9eg/ZCU102 or larger (BRAM-bound on
+//        zu7ev). Algorithm verified at 16 PEs (reference model + g++ TB).
+#ifndef N_PES
+#define N_PES         8
+#endif
 
 // MACs/cycle = VECTOR_SIZE * N_LANES * N_PES = 512  (@200MHz -> 204.8 GOPS)
 
 // ---- Precision --------------------------------------------------------------
+#ifdef USE_INT4
+#define W_BITS        4    // weight precision (int4)
+#define IA_BITS       4    // input-activation precision (int4)
+#define OA_BITS       4    // output-activation precision (int4)
+#else
 #define W_BITS        8    // weight precision (int8)
 #define IA_BITS       8    // input-activation precision (int8)
 #define OA_BITS       8    // output-activation precision (int8)
+#endif
 #define ACC_BITS      32   // accumulation precision (paper uses 24b; 32b is free on FPGA)
+
+// Saturation bounds and testbench value ranges derived from the precision
+#define OA_MAX   ((1 << (OA_BITS - 1)) - 1)
+#define OA_MIN   (-(1 << (OA_BITS - 1)))
+#define IA_RMAX  ((1 << (IA_BITS - 1)) - 1)
+#define IA_RMIN  (-(1 << (IA_BITS - 1)))
+#define W_RMAX   ((1 << (W_BITS - 1)) - 1)
+#define W_RMIN   (-(1 << (W_BITS - 1)))
+// TB requant-shift correction: products shrink by this many bits vs int8
+#define SHIFT_DELTA ((W_BITS - 8) + (IA_BITS - 8))
 
 // ---- On-chip buffer sizing (per PE) -----------------------------------------
 // Shrunk to Simba scale in Phase 3a (BRAM budget of the multi-PE array).

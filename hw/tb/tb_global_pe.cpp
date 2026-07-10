@@ -17,8 +17,8 @@ static int8_t golden_sat_shift(int64_t x, int shift, bool relu) {
         x += ((int64_t)1 << (shift - 1));
     x >>= shift;
     if (relu && x < 0) x = 0;
-    if (x > 127)  x = 127;
-    if (x < -128) x = -128;
+    if (x > OA_MAX) x = OA_MAX;
+    if (x < OA_MIN) x = OA_MIN;
     return (int8_t)x;
 }
 
@@ -33,7 +33,7 @@ static int test_eltwise(int H, int W, int C1, int multA, int multB, int shift,
                         int relu, unsigned seed) {
     const int n = H * W * C1;
     std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> d8(OA_MIN, OA_MAX);
     std::vector<int8_t> a(n * N_LANES), b(n * N_LANES);
     for (auto &v : a) v = (int8_t)d8(rng);
     for (auto &v : b) v = (int8_t)d8(rng);
@@ -66,7 +66,7 @@ static int test_pool(int mode, int H, int W, int C1, int R, int S, int stride,
     const int Q = (W + 2 * pad - S) / stride + 1;
     const int n = H * W * C1;
     std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> d8(-128, 127);
+    std::uniform_int_distribution<int> d8(OA_MIN, OA_MAX);
     std::vector<int8_t> a(n * N_LANES);
     for (auto &v : a) v = (int8_t)d8(rng);
 
@@ -81,7 +81,7 @@ static int test_pool(int mode, int H, int W, int C1, int R, int S, int stride,
         for (int q = 0; q < Q; ++q)
             for (int c1 = 0; c1 < C1; ++c1)
                 for (int l = 0; l < N_LANES; ++l) {
-                    int32_t mx = -128, sum = 0;
+                    int32_t mx = OA_MIN, sum = 0;
                     for (int r = 0; r < R; ++r)
                         for (int s = 0; s < S; ++s) {
                             const int ih = p * stride - pad + r;
