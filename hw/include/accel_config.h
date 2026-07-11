@@ -82,8 +82,12 @@
 // Number of output rows kept in the accumulation buffer (row-group size).
 // With C-tiling (C2>1) psums stay resident here across the c2 loop.
 // If P is not a multiple of PT_ROWS, the tail rows of the last group are
-// computed and then discarded.
+// computed and then discarded. Overridable: -DPT_ROWS=4 halves each acc bank
+// to one BRAM18 (-8 BRAM18/PE) at the cost of more weight reloads when C2>1
+// — used together with USE_URAM_ROWBUF to fit 16 PEs on a zu7ev.
+#ifndef PT_ROWS
 #define PT_ROWS       8
+#endif
 
 // Maximum output channels (bias buffer sizing)
 #define K_MAX         2048

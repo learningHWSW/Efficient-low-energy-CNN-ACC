@@ -285,7 +285,13 @@ static void pe_worker(hls::stream<iavec_t> &ia_st, hls::stream<wvec_t> &w_st,
 #pragma HLS bind_storage variable = wbuf type = ram_2p impl = bram
 #pragma HLS array_partition variable = wbuf complete dim = 2
     iavec_t rowbuf[IABUF_DEPTH];
+#ifdef USE_URAM_ROWBUF
+    // devices with spare UltraRAM (e.g. zu7ev: 96) can host the row buffers
+    // there, freeing ~8 BRAM18/PE — this is what makes 16 PEs fit a zu7ev
+#pragma HLS bind_storage variable = rowbuf type = ram_2p impl = uram
+#else
 #pragma HLS bind_storage variable = rowbuf type = ram_2p impl = bram
+#endif
     acc_t acc_buf[PT_ROWS][Q_MAX][N_LANES];
 #pragma HLS bind_storage variable = acc_buf type = ram_2p impl = bram
 #pragma HLS array_partition variable = acc_buf complete dim = 3

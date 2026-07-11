@@ -222,13 +222,18 @@ MAGNet의 대표 기능(4-bit로 성능/면적 개선)을 컴파일 스위치로
   (N_LANES·OA_BITS)` 비율로 환산(int8 ×1, int4 ×2). K는 VECTOR_SIZE 배수 요구.
 - 매퍼 추정 ResNet-50: int8 20.3ms → **int4 11.8ms**(고유 shape 1회 기준).
 
-**16 PE 구성**: `N_PES`는 빌드 스위치(-DN_PES=16, `hls_config_pe16.cfg`).
-기능 검증 완료 — 레퍼런스 모델 24/24 + g++ TB 36케이스(int8/int4 각각).
-구조 합성도 확인됨(II=1, violation 없음 — zu7ev 파트로 스케줄 검증; 리소스는
-초과). **실사용은 zu9eg(ZCU102)급 + Enterprise 라이선스 필요** (무료 BASIC은
-zu9eg 미지원, zu7ev는 BRAM 물리 부족). `mapper.py --pes 16 [--int4]`,
-`run_hls.ps1 pe16-csim|pe16-synth`. 매퍼 추정(고유 shape 1회): 16 PE int8
-13.4ms, int4 8.7ms.
+**16 PE 구성** (`-DN_PES=16`): 기능 검증(모델 24/24, g++ int8/int4 36케이스)
++ 합성 검증 완료. 디바이스 선택지 3가지 (합성 실측):
+
+| 타깃 | 라이선스 | 조건 | BRAM/URAM/DSP/LUT | 비고 |
+|---|---|---|---|---|
+| **zu7ev (ZCU104)** | **무료** | `USE_URAM_ROWBUF` + `PT_ROWS=4` (`hls_config_pe16_zu7ev.cfg`) | **85% / 16% / 52% / 76%** | 성능 손실 없음(매퍼 34.8ms, PT8과 동일). LUT 76%라 P&R 타이밍 노력 필요 가능 |
+| xcku5p | 무료 | 기본 구성 그대로 | 82% / 0 / 50% / 81% | ARM PS 없음 → XRT 임베디드 플로우 불가, 보드 희소 |
+| zu9eg (ZCU102) | Enterprise | 기본 구성 (`hls_config_pe16.cfg`) | 43% / 0 / 36% / 63% | 가장 여유 |
+
+BRAM 절약 원리: rowbuf→URAM(-128 BRAM18), PT_ROWS 4(acc 뱅크가 BRAM36→
+BRAM18, -128). `mapper.py --pes 16 [--int4]`. 매퍼 추정(전체 네트워크):
+16 PE int8 ~28.8 fps, int4 조합 시 2048 MAC/cycle.
 
 ### 참고 문헌 (resources/)
 - MAGNet: A Modular Accelerator Generator for Neural Networks — ICCAD 2019

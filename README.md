@@ -12,9 +12,10 @@ NVIDIA **MAGNet** (ICCAD 2019) 논문의 모듈형 가속기 템플릿을 AMD Vi
 - ✅ **런타임 spatial 매핑** KP×CP: K-split(8×1)/혼합(4×2)/C-split(1×8),
   mapper가 레이어별 자동 선택. gather는 (q,kp) flatten II=1 구조라
   N_PES를 키워도 리소스가 늘지 않음
-- ✅ **16 PE 구성** (`-DN_PES=16`, `hls_config_pe16.cfg`): 기능 검증 완료
-  (g++ int8/int4 각 36케이스) + 구조 합성 확인. **zu9eg(ZCU102)급 +
-  Enterprise 라이선스 필요** (zu7ev는 BRAM 초과). `mapper.py --pes 16`
+- ✅ **16 PE 구성** (`-DN_PES=16`): **무료 라이선스 ZCU104에서 합성 성공** —
+  `hls_config_pe16_zu7ev.cfg` (rowbuf→URAM + PT_ROWS=4): BRAM 85%/URAM 16%/
+  DSP 52%/LUT 76%, II=1, 성능 손실 없음(~28.8 fps 추정). 대안: xcku5p(무료,
+  PS 없음), zu9eg(여유, Enterprise). `mapper.py --pes 16`
 - ✅ PE 내부: OS-LWS 데이터플로우, C-타일링, DSP packing(2MAC/DSP, 전수 검증)
 - ✅ **Vitis 2026.1 csim 통과**: 12 레이어 × 3 spatial = 36 케이스 골든 일치.
   16 PE 구성도 알고리즘 검증 완료(모델 24/24) — zu9eg + Enterprise 라이선스
