@@ -15,6 +15,12 @@ v++*.log
 __pycache__/
 *.pyc
 
+# Quantization exports (regenerable from export_resnet50.py) and calib images
+sw/quant/export*/
+sw/quant/calib/*.jpg
+sw/quant/calib/*.jpeg
+sw/quant/calib/*.png
+
 # Windows / OneDrive
 desktop.ini
 Thumbs.db

@@ -12,6 +12,10 @@
 //   gmem_w    : W   KRSC,  in words [Kpad][R][S][C1]  (K padded to an N_LANES multiple)
 //   gmem_oa   : OA  NHWC,  in words [P][Q][K1]        (word = N_LANES int8)
 //   gmem_bias : int32 [Kpad]
+//   gmem_mult : int32 [Kpad] — per-output-channel requant multipliers
+//               (per-channel quantization; fill uniformly for per-tensor).
+//               The scalar `mult` argument is retained for interface
+//               stability but is no longer used by the conv requant.
 extern "C" void magnet_top(
     const iavec_t *gmem_ia0,
     const iavec_t *gmem_ia1,
@@ -20,6 +24,7 @@ extern "C" void magnet_top(
     const wvec_t  *gmem_w,
     oavec_t       *gmem_oa,
     const bias_t  *gmem_bias,
+    const bias_t  *gmem_mult,
     int H, int W, int C1, int K1, int K,
     int P, int Q, int R, int S,
     int stride, int pad, int CT1,

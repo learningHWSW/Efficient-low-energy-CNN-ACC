@@ -113,11 +113,12 @@ int main(int argc, char **argv) {
     const size_t oa_bytes = (size_t)P * Q * K1 * 8;
     const size_t b_bytes  = (size_t)K1 * N_LANES * 4;
 
-    // arg order: ia0..ia3 (aliases of one buffer), w, oa, bias
+    // arg order: ia0..ia3 (aliases of one buffer), w, oa, bias, mult
     auto bo_ia = xrt::bo(device, ia_bytes, conv.group_id(0));
     auto bo_w  = xrt::bo(device, w_bytes,  conv.group_id(4));
     auto bo_oa = xrt::bo(device, oa_bytes, conv.group_id(5));
     auto bo_b  = xrt::bo(device, b_bytes,  conv.group_id(6));
+    auto bo_m  = xrt::bo(device, b_bytes,  conv.group_id(7)); // per-ch mult
 
     // (real use: fill quantized weight/bias/input here)
     std::vector<uint8_t> zeros(ia_bytes, 0);
@@ -125,9 +126,10 @@ int main(int argc, char **argv) {
     bo_ia.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_m.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // ---- run conv (argument order = magnet_top.h) ----
-    auto run = conv(bo_ia, bo_ia, bo_ia, bo_ia, bo_w, bo_oa, bo_b,
+    auto run = conv(bo_ia, bo_ia, bo_ia, bo_ia, bo_w, bo_oa, bo_b, bo_m,
                     H, W, C1, K1, K, P, Q, R, S,
                     stride, pad, pl.CT1, pl.KP, pl.CP,
                     mult, shift, relu);

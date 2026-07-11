@@ -434,15 +434,20 @@ PE_K1G:
 //   The psum streams are read once per q (at kp==0) into registers.
 // ===========================================================================
 static void gather_store(hls::stream<psum_t> psum_st[N_PES], oavec_t *gmem_oa,
-                         const bias_t *gmem_bias, LayerCfg cfg) {
+                         const bias_t *gmem_bias, const bias_t *gmem_mult,
+                         LayerCfg cfg) {
     const Derived d = derive(cfg);
     bias_t bias_reg[N_PES][N_LANES];
 #pragma HLS array_partition variable = bias_reg complete dim = 0
+    // per-output-channel requant multipliers (per-channel quantization);
+    // a uniform table reproduces the old per-tensor behavior
+    bias_t mult_reg[N_PES][N_LANES];
+#pragma HLS array_partition variable = mult_reg complete dim = 0
 
 G_K1G:
     for (int k1g = 0; k1g < d.K1G; ++k1g) {
 #pragma HLS loop_tripcount min = 1 max = 16
-        // ---- load bias (0 for k1 >= K1) ----
+        // ---- load bias + per-channel mult (0 for k1 >= K1) ----
     G_BIAS:
         for (int kp = 0; kp < N_PES; ++kp) {
             const int k1 = k1g * cfg.KP + kp;
@@ -452,6 +457,8 @@ G_K1G:
 #pragma HLS pipeline II = 1
                 bias_reg[kp][lane] =
                     valid ? gmem_bias[k1 * N_LANES + lane] : (bias_t)0;
+                mult_reg[kp][lane] =
+                    valid ? gmem_mult[k1 * N_LANES + lane] : (bias_t)0;
             }
         }
 
@@ -494,7 +501,9 @@ G_K1G:
                                     sum += vals[pe].v[lane];
                             }
                             oavec_set(ov, lane,
-                                      requantize(sum, cfg.mult, cfg.shift,
+                                      requantize(sum,
+                                                 (int)mult_reg[kp][lane],
+                                                 cfg.shift,
                                                  cfg.relu_en != 0));
                         }
                         gmem_oa[(p * cfg.Q + q) * cfg.K1 + k1] = ov;
@@ -516,6 +525,7 @@ static void magnet_core(const iavec_t *gmem_ia0, const iavec_t *gmem_ia1,
                         const iavec_t *gmem_ia2, const iavec_t *gmem_ia3,
                         const wvec_t *gmem_w,
                         oavec_t *gmem_oa, const bias_t *gmem_bias,
+                        const bias_t *gmem_mult,
                         LayerCfg cfg) {
 #pragma HLS dataflow
     hls::stream<iavec_t> ia_st[N_PES];
@@ -533,7 +543,7 @@ PE_INST:
 #pragma HLS unroll
         pe_worker(ia_st[pe], w_st[pe], psum_st[pe], cfg);
     }
-    gather_store(psum_st, gmem_oa, gmem_bias, cfg);
+    gather_store(psum_st, gmem_oa, gmem_bias, gmem_mult, cfg);
 }
 
 // ===========================================================================
@@ -547,6 +557,7 @@ extern "C" void magnet_top(
     const wvec_t  *gmem_w,
     oavec_t       *gmem_oa,
     const bias_t  *gmem_bias,
+    const bias_t  *gmem_mult,
     int H, int W, int C1, int K1, int K,
     int P, int Q, int R, int S,
     int stride, int pad, int CT1,
@@ -559,6 +570,7 @@ extern "C" void magnet_top(
 #pragma HLS INTERFACE m_axi port = gmem_w    offset = slave bundle = gmem1 depth = GMEM_DEPTH
 #pragma HLS INTERFACE m_axi port = gmem_oa   offset = slave bundle = gmem2 depth = GMEM_DEPTH
 #pragma HLS INTERFACE m_axi port = gmem_bias offset = slave bundle = gmem3 depth = 4096
+#pragma HLS INTERFACE m_axi port = gmem_mult offset = slave bundle = gmem3 depth = 4096
 #pragma HLS INTERFACE s_axilite port = H
 #pragma HLS INTERFACE s_axilite port = W
 #pragma HLS INTERFACE s_axilite port = C1
@@ -601,5 +613,5 @@ extern "C" void magnet_top(
 #endif
 
     magnet_core(gmem_ia0, gmem_ia1, gmem_ia2, gmem_ia3,
-                gmem_w, gmem_oa, gmem_bias, cfg);
+                gmem_w, gmem_oa, gmem_bias, gmem_mult, cfg);
 }

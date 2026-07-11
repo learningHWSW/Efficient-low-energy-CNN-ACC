@@ -214,16 +214,18 @@ def pe_worker(ia_st, w_st, psum_st, cfg, pe):
                     psum_st.write(list(acc_buf[p0][q_]))
 
 
-def gather_store(psum_st, d_bias, d_oa, cfg):
+def gather_store(psum_st, d_bias, d_mult, d_oa, cfg):
     qb, win_cols, c1s, C2, P2, K1G = derive(cfg)
     KP, CP, K1, Q, P = cfg["KP"], cfg["CP"], cfg["K1"], cfg["Q"], cfg["P"]
     for k1g in range(K1G):
         bias_reg = [[0] * N_LANES for _ in range(N_PES)]
+        mult_reg = [[0] * N_LANES for _ in range(N_PES)]
         for kp in range(KP):
             k1 = k1g * KP + kp
             if k1 < K1:
                 for lane in range(N_LANES):
                     bias_reg[kp][lane] = d_bias[k1 * N_LANES + lane]
+                    mult_reg[kp][lane] = d_mult[k1 * N_LANES + lane]
         for p1 in range(P2):
             for p0 in range(PT_ROWS):
                 p = p1 * PT_ROWS + p0
@@ -239,12 +241,13 @@ def gather_store(psum_st, d_bias, d_oa, cfg):
                         for lane in range(N_LANES):
                             s = sum(vals[kp * CP + cp][lane] for cp in range(CP))
                             word.append(requantize(s + bias_reg[kp][lane],
-                                                   cfg["mult"], cfg["shift"],
+                                                   mult_reg[kp][lane],
+                                                   cfg["shift"],
                                                    cfg["relu"]))
                         d_oa[(p * Q + q) * K1 + k1] = word
 
 
-def dut(d_ia, d_w, d_bias, cfg):
+def dut(d_ia, d_w, d_bias, d_mult, cfg):
     """Mirror of magnet_top(): runs the tasks sequentially (same semantics as
     csim's dataflow)."""
     assert cfg["KP"] * cfg["CP"] == N_PES
@@ -261,7 +264,7 @@ def dut(d_ia, d_w, d_bias, cfg):
     w_loader(d_w, w_st, cfg)
     for pe in range(N_PES):
         pe_worker(ia_st[pe], w_st[pe], psum_st[pe], cfg, pe)
-    gather_store(psum_st, d_bias, d_oa, cfg)
+    gather_store(psum_st, d_bias, d_mult, d_oa, cfg)
 
     for st in ia_st + w_st + psum_st:
         st.check_drained()
@@ -317,7 +320,8 @@ def run_test(name, H, W, C, K, R, S, stride, pad, mult, shift, relu, seed,
     cfg = dict(H=H, W=W, C1=C1, K1=K1, K=K, P=P, Q=Q, R=R, S=S,
                stride=stride, pad=pad, CT1=CT1, KP=KP, CP=CP,
                mult=mult, shift=shift, relu=relu)
-    d_oa = dut(d_ia, d_w, bias, cfg)
+    d_mult = [mult] * Kp   # uniform per-channel table (per-tensor behavior)
+    d_oa = dut(d_ia, d_w, bias, d_mult, cfg)
 
     errors = 0
     for p in range(P):

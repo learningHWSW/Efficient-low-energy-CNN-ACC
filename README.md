@@ -32,6 +32,22 @@ NVIDIA **MAGNet** (ICCAD 2019) 논문의 모듈형 가속기 템플릿을 AMD Vi
   MAC/cycle = 409.6 GOPS**. int8/int4 양쪽 회귀 PASS(g++ + Vitis csim),
   ResNet-50 추정 int8 20ms → int4 12ms. `run_hls.ps1 int4-csim|int4-synth`,
   `mapper.py --int4`
+- ✅ **실가중치 파이프라인 end-to-end**: `sw/quant/export_resnet50.py`(사전학습
+  ResNet-50 → BN 폴딩 → PTQ → mult/shift → 가속기 레이아웃 export, int8
+  self-check top-1 4/4) + `hw/tb/tb_resnet50_real.cpp`(manifest/바이너리
+  로더 → net_runner → 커널 실행). **실제 224×224 ResNet-50 전체(72레이어,
+  fc 포함)가 커널 경로에서 Python 정수 시뮬레이션과 비트 일치, logits
+  0/1000 불일치** (`run_hls.ps1 real`)
+- ✅ **실이미지 검증** (fruits262에서 48장 샘플링, `fetch_calib_images.py`):
+  실이미지 캘리브레이션 + **percentile 클리핑(기본 99.99, 스윕 결과 최적)**
+  으로 **양자화 충실도 top-1 11/16, float-top1 ∈ int8-top5 16/16**
+  (abs-max 10/16, 99.9는 과도 클리핑으로 7/16). 커널 경로 실이미지 분류도
+  비트 일치
+- ✅ **per-channel weight 양자화** (HW: gather에 per-lane mult 테이블
+  `gmem_mult[Kpad]`, **DSP 증가 0**): **양자화 충실도 top-1 14/16**
+  (per-tensor 11/16 → +3), top-5 16/16. swc 하한(max/256)으로 bias int32
+  오버플로 방지. 커널 경로 비트 일치·csim 36/36·csynth 리소스 불변.
+  int4 개선은 per-vector 스케일/QAT (향후)
 - ✅ **XRT 호스트/링크 딜리버러블**: `sw/host/xrt_host.cpp` + `hw/scripts/system.cfg`
   (보드·플랫폼 미보유로 실기 검증은 보류 — Phase 4b)
 - ℹ 제약: Q ≤ 128 (ResNet-50 전 레이어 커버; VGG-224급은 W 타일링 필요),
@@ -61,6 +77,8 @@ hw/
   scripts/run_hls.ps1      # 빌드 래퍼 (csim/synth/gpe-*/gcc/net)
   scripts/hls_config*.cfg  # Vitis 통합 플로우 설정 (커널별)
 sw/
+  quant/export_resnet50.py # 사전학습 ResNet-50 PTQ → 가속기 레이아웃 export
+  quant/calib/             # 캘리브레이션 이미지 폴더 (.jpg를 넣으면 사용)
   mapper/mapper.py         # MAGNet Mapper (spatial/타일 선택 + 사이클/트래픽 모델)
   model/reference_model.py # 비트-정확 Python 모델 (스트림 개수 검증 포함)
   runtime/net_runner.h     # 레이어 시퀀서 + plan_conv (Phase 4에서 XRT로 교체)

@@ -63,12 +63,16 @@ static int run_test(const TestCase &tc, int KP, int CP, unsigned seed) {
     std::vector<int8_t> w(tc.K * tc.R * tc.S * tc.C);
 #ifdef COSIM_SMALL
     std::vector<int32_t> bias(4096, 0);   // sized to the bias m_axi depth
+    std::vector<int32_t> mults(4096, 0);
 #else
     std::vector<int32_t> bias(Kp, 0);
+    std::vector<int32_t> mults(Kp, 0);
 #endif
     for (auto &v : ia) v = (int8_t)dia(rng);
     for (auto &v : w)  v = (int8_t)dw(rng);
     for (int k = 0; k < tc.K; ++k) bias[k] = db(rng);
+    // uniform per-channel mult table = the layer's per-tensor mult
+    for (int k = 0; k < Kp; ++k) mults[k] = tc.mult;
 
     // ---- device arrays (NHWC / KRSC; C1 zero-padded to CP*VECTOR_SIZE) ----
     // The cosim wrapper copies m_axi-depth elements, so allocate at least that
@@ -125,7 +129,7 @@ static int run_test(const TestCase &tc, int KP, int CP, unsigned seed) {
 
     // ---- run DUT (the four IA pointers alias the same buffer) ----
     magnet_top(d_ia.data(), d_ia.data(), d_ia.data(), d_ia.data(),
-               d_w.data(), d_oa.data(), bias.data(),
+               d_w.data(), d_oa.data(), bias.data(), mults.data(),
                tc.H, tc.W, C1, K1, tc.K, P, Q, tc.R, tc.S,
                tc.stride, tc.pad, CT1, KP, CP, tc.mult, shift, tc.relu);
 

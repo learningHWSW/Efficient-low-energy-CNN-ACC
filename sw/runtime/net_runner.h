@@ -55,6 +55,8 @@ struct ConvParams {
     int mult = 1, shift = 0, relu = 0;
     std::vector<wvec_t> w;      // [Kpad][R][S][C1] (C1 = input tensor's C1)
     std::vector<bias_t> bias;   // [Kpad]
+    std::vector<bias_t> mults;  // [Kpad] per-channel requant multipliers;
+                                // left empty -> uniform table from `mult`
 };
 
 struct ConvPlan {
@@ -134,9 +136,14 @@ inline void run_conv(const Tensor &in, const ConvParams &cp, Tensor &out) {
            "K must be a VECTOR_SIZE multiple for chaining");
     const int c1_out = cp.K / VECTOR_SIZE;
     out.alloc(P, Q, c1_out);
+    // per-channel mult table; empty -> uniform table from the scalar mult
+    std::vector<bias_t> mults = cp.mults;
+    if (mults.empty())
+        mults.assign(K1 * N_LANES, (bias_t)cp.mult);
+    assert((int)mults.size() == K1 * N_LANES);
     // the four IA pointers alias the same buffer (multi-port loader)
     magnet_top(in.data.data(), in.data.data(), in.data.data(), in.data.data(),
-               cp.w.data(), out.as_oa(), cp.bias.data(),
+               cp.w.data(), out.as_oa(), cp.bias.data(), mults.data(),
                in.H, in.W, in.C1, K1, cp.K, P, Q, cp.R, cp.S,
                cp.stride, cp.pad, pl.CT1, pl.KP, pl.CP,
                cp.mult, cp.shift, cp.relu);

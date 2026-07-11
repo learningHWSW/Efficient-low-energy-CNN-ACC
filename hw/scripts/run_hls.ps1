@@ -85,6 +85,15 @@ switch ($Mode) {
             -o build/tb_network.exe
         if ($LASTEXITCODE -eq 0) { & ".\build\tb_network.exe" }
     }
+    "real" {
+        # real quantized ResNet-50 from sw/quant/export (g++)
+        $gxx = "$XILINX\Model_Composer\tps\mingw\10.0.0\win64.o\nt\bin\g++.exe"
+        New-Item -ItemType Directory -Force build | Out-Null
+        & $gxx -std=c++14 -O2 -I hw/include -I "$XILINX\Vitis\include" `
+            hw/src/magnet_top.cpp hw/src/global_pe.cpp `
+            hw/tb/tb_resnet50_real.cpp -o build/tb_resnet50_real.exe
+        if ($LASTEXITCODE -eq 0) { & ".\build\tb_resnet50_real.exe" }
+    }
     "resnet" {
         # full ResNet-50: mapping dry run + reduced-size e2e (g++)
         $gxx = "$XILINX\Model_Composer\tps\mingw\10.0.0\win64.o\nt\bin\g++.exe"
