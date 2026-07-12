@@ -1,258 +1,278 @@
-# 아키텍처 설계 문서 — MAGNet-style CNN 가속기 (Vitis HLS)
+# Architecture — MAGNet/Simba-style CNN accelerator (Vitis HLS)
 
-이 문서는 `resources/`의 NVIDIA 논문들(MAGNet, Simba, Buffets)과
-Sze의 *Efficient Processing of Deep Neural Networks* 를 근거로,
-MAGNet의 PE 아키텍처 템플릿을 AMD Vitis HLS(FPGA)로 옮긴 설계를 설명한다.
+This document describes the design, which ports MAGNet's PE architectural
+template to AMD Vitis HLS (FPGA) and adds Simba's system-level structure, based
+on the NVIDIA papers in `resources/` (MAGNet, Simba, Buffets) and Sze's
+*Efficient Processing of Deep Neural Networks*.
 
 ---
 
-## 1. MAGNet 요약과 본 설계의 대응 관계
+## 1. MAGNet mapping
 
-MAGNet (ICCAD 2019)은 세 가지 컴포넌트로 구성된다.
+MAGNet (ICCAD 2019) has three components:
 
-| MAGNet 컴포넌트 | 역할 | 본 프로젝트 대응 |
+| MAGNet component | Role | This project |
 |---|---|---|
-| **Designer** | C++/SystemC 템플릿 → HLS로 RTL 생성 | `hw/src/magnet_top.cpp` + `hw/include/accel_config.h` (컴파일타임 파라미터) |
-| **Mapper** | 레이어→하드웨어 매핑(타일링, 순서) 탐색 | `sw/mapper/mapper.py` (제약 검증 + 사이클/트래픽 모델) |
-| **Tuner** | 베이지안 최적화 기반 설계공간 탐색 | Phase 4 (config sweep 스크립트로 시작) |
+| **Designer** | C++/SystemC template → RTL via HLS | `hw/src/magnet_top.cpp` + `hw/include/accel_config.h` (compile-time params) |
+| **Mapper** | Layer→hardware mapping (tiling, ordering) | `sw/mapper/mapper.py` (constraint check + cycle/traffic model) |
+| **Tuner** | Bayesian design-space exploration | `sw/tuner/tuner.py` (exhaustive DSE) |
 
-### 컴퓨트 계층 (논문 Fig. 2)
+### Compute hierarchy (paper Fig. 2)
 
 ```
-System ── N_PES 개의 PE + Global Buffer  (Phase 3)
-  └─ PE ── N_LANES 개의 Vector MAC + W/IA/Accum buffer + PPU   ← 현재 구현
+System ── N_PES PEs + cross-PE reduction / Global PE
+  └─ PE ── N_LANES Vector MACs + W/IA/Accum buffers + PPU
        └─ Vector MAC ── VECTOR_SIZE-wide dot product
 ```
 
-### 설계시점 파라미터 (논문 Table I ↔ `accel_config.h`)
+### Design-time parameters (paper Table I ↔ `accel_config.h`)
 
-| 논문 | 코드 | 기본값 | 의미 |
+| Paper | Code | Default | Meaning |
 |---|---|---|---|
-| VectorSize | `VECTOR_SIZE` | 8 | dot-product 폭 = **C(입력채널) 차원 공간 매핑** |
-| NLanes | `N_LANES` | 8 | PE 내 vector MAC 수 = **K(출력채널) 차원 공간 매핑** |
-| WPrecision | `W_BITS` | 8 | int8 가중치 |
-| IAPrecision | `IA_BITS` | 8 | int8 activation |
-| AccumPrecision | `ACC_BITS` | 32 | FPGA에서는 32b가 자연스러움 (논문 24b) |
-| WeightBufSize | `WBUF_DEPTH` | 1024 | lane별 뱅크, word=64b → lane당 8KB |
-| IABufSize | `IABUF_DEPTH` | 8192 | word=64b → 64KB |
-| AccumBufSize | `Q_MAX` | 256 | 출력 한 행의 partial sum 라인 |
-| NPEs | `N_PES` | 1 | Phase 3에서 확장 |
+| VectorSize | `VECTOR_SIZE` | 8 (16 for int4) | dot-product width = **spatial map of C (input channels)** |
+| NLanes | `N_LANES` | 8 | vector MACs per PE = **spatial map of K (output channels)** |
+| NPEs | `N_PES` | 8 (build switch) | PE array size |
+| WPrecision | `W_BITS` | 8 / 4 | int8 or int4 weights |
+| IAPrecision | `IA_BITS` | 8 / 4 | int8 or int4 activations |
+| AccumPrecision | `ACC_BITS` | 32 | 32b is natural on FPGA (paper uses 24b) |
+| WeightBufSize | `WBUF_DEPTH` | 256 | per-lane bank, 64b word |
+| IABufSize | `IABUF_DEPTH` | 2048 | 64b word |
+| AccumBufSize | `Q_MAX` × `PT_ROWS` | 128 × 8 | partial sums of a row group |
 
-기본 구성의 처리량: **64 MAC/cycle = 25.6 GOPS @ 200 MHz** (MAC=2op 기준).
+Default throughput: **512 MAC/cycle = 204.8 GOPS @ 200 MHz** (8 PEs, int8;
+1024 MAC/cycle with int4 or 16 PEs).
 
 ---
 
-## 2. 데이터플로우: OS-LWS (Output Stationary – Local Weight Stationary)
+## 2. Dataflow: OS-LWS (Output Stationary – Local Weight Stationary)
 
-논문 Fig. 12의 결론 — **OS-LWS가 거의 모든 구성에서 에너지 최적** — 을 따라
-OS-LWS를 기본 데이터플로우로 구현했다 (논문 Fig. 4(e)의 loop nest).
+Following the paper's Fig. 12 result — **OS-LWS is most energy-efficient in
+nearly every configuration** — OS-LWS is the default dataflow (paper Fig. 4(e)
+loop nest):
 
 ```
-for k1 = [0 : K1)          # 출력채널 타일 (N_LANES 개씩)     — temporal
-  for p1 = [0 : P2)         # 출력 행 그룹 (PT_ROWS 개씩)      — temporal
-    for c2 = [0 : C2)       # 입력채널 타일 (CT1 word씩)       — temporal (psum 누적)
-      for p0 = [0 : PT)     # 그룹 내 행 — load ‖ compute 오버랩(dataflow)
-        for (r, s, c1)      # 커널 위치 × 타일 내 채널 word    — temporal
-          for q0 = [0 : QB) # 출력 열 (innermost)              — temporal
+for k1 = [0 : K1)          # output-channel tile (N_LANES each)  — temporal
+  for p1 = [0 : P2)        # output-row group (PT_ROWS each)     — temporal
+    for c2 = [0 : C2)      # input-channel tile (CT1 words)      — temporal (psum accumulate)
+      for p0 = [0 : PT)    # row within group — load ‖ compute overlap (dataflow)
+        for (r, s, c1)     # kernel position × channel word in tile — temporal
+          for q0 = [0 : QB) # output column (innermost)          — temporal
             acc[p0][q0][lane] += W[k1,lane, r,s,c2·CT1+c1]
                                  · IA[p·st+r, q0·st+s, c2·CT1+c1]
-            # lane ∈ N_LANES (공간), · 는 VECTOR_SIZE-wide dot (공간)
+            # lane ∈ N_LANES (spatial), · is a VECTOR_SIZE-wide dot (spatial)
 ```
 
-- **LWS**: `(r,s,c1)`이 고정된 동안 같은 weight word가 q0 루프 전체(QB회)에서 재사용된다.
-  논문의 weight collector(래치 어레이)에 해당하는 재사용이며, FPGA에서는 BRAM 읽기
-  에너지가 싸므로 별도 latch 계층 없이 주소 고정으로 같은 순서를 얻는다.
-- **OS**: partial sum이 `acc_buf[p0][q][lane]`(accumulation buffer)에 머물며
-  모든 c2 타일에 걸쳐 R·S·C1 회 read-modify-write 누적된다. psum의 DRAM 왕복이 없다.
-- **C-타일링** (Phase 2): 필터가 weight buffer보다 크면 입력채널을 CT1 word
-  타일로 쪼개고(c2 루프), psum은 acc_buf에 상주한 채 타일들을 누적한다.
-  C2>1일 때 weight 타일은 (k1,p1,c2)마다 재로드되며(태그 캐시로 C2==1이면 k1당
-  1회), 이것이 psum-stationary의 대가다. 현재 기본 버퍼에선 ResNet-50 전
-  레이어가 C2=1이고, 멀티 PE를 위해 버퍼를 줄일 때 C-타일링이 활성화된다.
-- **Double buffering** (Phase 2): p0 루프가 HLS dataflow 영역 — IA row buffer가
-  iteration별 PIPO(ping-pong)가 되어 load_ia(p0+1)와 compute(p0)가 오버랩된다.
-  stride 1 레이어에서 IA 로드는 compute에 완전히 가려진다.
-- **DSP packing** (Phase 2): 이웃 lane 쌍이 같은 activation을 공유하므로
-  `(w1≪18 + w0)×a` 27×18 곱셈 1개로 MAC 2개를 얻는다(WP487). borrow 보정
-  산술은 (w0,w1,a) 전조합 16.7M 전수 검증. DSP 수요 64→32/PE.
-- PPU는 행 그룹 단위로 bias 포함 값을 requantize(scale·round) + ReLU + int8 saturate 한다.
+- **LWS**: while `(r,s,c1)` is fixed the same weight word is reused across the
+  whole q0 loop (QB times). This is the paper's weight-collector reuse; on FPGA,
+  BRAM reads are cheap, so the same ordering is obtained by holding the address
+  fixed, without a separate latch tier.
+- **OS**: partial sums stay in `acc_buf[p0][q][lane]` and are read-modify-written
+  R·S·C1 times across all c2 tiles. No psum round-trip to DRAM.
+- **C-tiling** (Phase 2): if a filter is larger than the weight buffer, the input
+  channels are split into CT1-word tiles (c2 loop) while psums stay resident in
+  acc_buf. When C2>1 the weight tile is reloaded per (k1,p1,c2) (a tag cache
+  loads it once per k1 when C2==1) — this is the price of psum-stationary. With
+  the default buffers every ResNet-50 layer has C2=1; C-tiling activates when the
+  buffers are shrunk for the multi-PE array.
+- **Double buffering** (Phase 2): the p0 loop is an HLS dataflow region — the IA
+  row buffer becomes a per-iteration PIPO (ping-pong) so load_ia(p0+1) overlaps
+  compute(p0). For stride-1 layers the IA load is fully hidden behind compute.
+- **DSP packing** (Phase 2): adjacent lane pairs share the same activation, so
+  `(w1≪18 + w0)×a` in one 27×18 multiply yields two MACs (Xilinx WP487). The
+  borrow-correction arithmetic is exhaustively verified over all 16.7M (w0,w1,a)
+  combinations. DSP demand 64→32 per PE.
+- The PPU requantizes each row group (bias + scale·round) with **per-output-channel
+  multipliers** + ReLU + int8/int4 saturation.
 
-### 파이프라인 안전장치 (`MIN_QB`)
+### Pipeline safety (`MIN_QB`)
 
-`acc_line` RMW는 같은 주소를 QB 사이클마다 재방문한다. II=1을 보장하려면
-재방문 거리가 파이프라인 깊이보다 커야 하므로, `QB = max(Q, MIN_QB=16)` 으로
-패딩하고 초과분 결과는 store 단계에서 버린다. HLS `dependence distance=16`
-pragma가 이 보장을 스케줄러에 전달한다.
+The acc_buf RMW revisits the same address every QB cycles. To guarantee II=1 the
+revisit distance must exceed the pipeline depth, so QB is padded to
+`max(Q, MIN_QB=16)` and excess results are discarded at store time. An HLS
+`dependence distance=16` pragma communicates this to the scheduler.
 
 ---
 
-## 3. 메모리 시스템
+## 3. Memory system
 
-### 온칩 버퍼 (MAGNet Fig. 2(b) 대응)
+### On-chip buffers (paper Fig. 2(b))
 
-| 버퍼 | 구조 | 크기(기본) | 논문 대응 |
-|---|---|---|---|
-| `wbuf[WBUF_DEPTH][N_LANES]` | lane별 완전 분할(BRAM 뱅크 8개), (k1,c2) 타일 캐시 | 64KB | Weight buffer (read port = W_BITS×NLanes×VectorSize) |
-| `rowbuf[IABUF_DEPTH]` | dataflow PIPO(×2), zero-pad 포함 R개 입력 행 | 64KB×2 | Input activation buffer (buffet fill/read 분리) |
-| `acc_buf[PT_ROWS][Q_MAX][N_LANES]` | lane별 완전 분할, c2 루프 동안 psum 상주 | 64KB | Accumulation buffer (RMW, buffet update) |
-| `bias_reg[N_LANES]` | 레지스터 | — | (PPU bias) |
-
-Buffets 논문의 fill/read/update 시맨틱 중 **update**(RMW)는 `acc_line`이,
-**fill→read 분리**는 load/compute 단계 분리가 담당한다. 명시적 credit 기반
-동기화(buffet)는 Phase 2의 load/compute/store 오버랩(double buffering)에서 도입한다.
-
-### DRAM 레이아웃 (호스트가 준비, word = 64b = 8×int8)
-
-| 배열 | 레이아웃 | 패딩 규칙 |
+| Buffer | Structure | Paper equivalent |
 |---|---|---|
-| IA | `[H][W][C1]` (NHWC) | C를 `VECTOR_SIZE` 배수로 zero-pad |
-| W | `[Kpad][R][S][C1]` (KRSC) | K를 `N_LANES` 배수로 zero-pad |
-| OA | `[P][Q][K1]`, word = N_LANES×int8 | lane ≥ K 부분은 무시 |
-| bias | `int32 [Kpad]` | k ≥ K 는 0 |
+| `wbuf[WBUF_DEPTH][N_LANES]` | per-lane partition (BRAM banks), (k1,c2) tile cache | Weight buffer |
+| `rowbuf[IABUF_DEPTH]` | dataflow PIPO (×2), R input rows incl. zero-pad; optionally in URAM | Input-activation buffer (buffet fill/read split) |
+| `acc_buf[PT_ROWS][Q_MAX][N_LANES]` | per-lane partition, psum resident across the c2 loop | Accumulation buffer (RMW, buffet update) |
+| `bias_reg` / `mult_reg` | registers | PPU bias + per-channel requant multipliers |
 
-### 매핑 제약 (mapper.py가 검증)
+Of the Buffets fill/read/update semantics, **update** (RMW) is handled by
+`acc_buf`, and the **fill→read split** by separating the load and compute stages;
+explicit credit-based synchronization is approximated by the load/compute/store
+overlap (double buffering).
+
+### DRAM layout (host-prepared, word = 64b = 8×int8 / 16×int4)
+
+| Array | Layout | Padding |
+|---|---|---|
+| IA | `[H][W][C1]` (NHWC) | C zero-padded to a `VECTOR_SIZE` multiple |
+| W | `[Kpad][R][S][C1]` (KRSC) | K zero-padded to an `N_LANES` multiple |
+| OA | `[P][Q][K1]`, word = N_LANES elements | lanes ≥ K ignored |
+| bias, mult | `int32 [Kpad]` | k ≥ K is 0 |
+
+### Mapping constraints (checked by mapper.py)
 
 ```
-R·S·C1                ≤ WBUF_DEPTH      # k1 타일의 필터가 통째로 적재
-R·win_cols·C1         ≤ IABUF_DEPTH     # win_cols = (QB-1)·stride + S
+R·S·CT1               ≤ WBUF_DEPTH
+R·win_cols·CT1        ≤ IABUF_DEPTH     # win_cols = (QB-1)·stride + S
 Q                     ≤ Q_MAX
 ```
-ResNet-50 / VGG-16의 모든 conv 레이어가 기본 구성에 들어간다
-(`python sw/mapper/mapper.py --network resnet50` 으로 확인).
+Every ResNet-50 conv layer fits the default configuration
+(`python sw/mapper/mapper.py --network resnet50`).
 
 ---
 
-## 3.5 멀티 PE 시스템 (Phase 3a — Simba chiplet 구조)
+## 3.5 Multi-PE system (Phase 3a — Simba chiplet structure)
 
-Simba(MICRO 2019) chiplet 내부를 HLS dataflow 태스크 4종으로 구현:
+The Simba (MICRO 2019) chiplet interior is implemented as four HLS dataflow tasks:
 
 ```
 ia_loader ──ia_st[pe]──▶ ┌─────┐
-(multicast/C-slice 분배) │ PE0 │─psum_st[0]─┐
+(multicast / C-slice)    │ PE0 │─psum_st[0]─┐
 w_loader  ──w_st[pe]───▶ │ ... │            ├──▶ gather_store
-(K/C 타일 분배)          │ PE3 │─psum_st[3]─┘    (cross-PE reduction
+(K/C tile distribution)  │ PEn │─psum_st[n]─┘    (cross-PE reduction
                          └─────┘                  + bias + PPU + store)
 ```
 
-- **Spatial 매핑** (런타임 KP×CP=N_PES, Simba Listing 2의 parallel_for):
-  - `KP` (K-split): PE 그룹이 서로 다른 k1 타일 담당. IA는 **multicast**
-    (DRAM 1회 읽기 → KP개 스트림) — 단일 PE 대비 IA 트래픽 ÷KP.
-  - `CP` (C-split): 그룹 내 PE가 입력채널 슬라이스 분담, psum을 gather에서
-    합산 = **Simba cross-PE partial-sum reduction**. bias는 reduction 후 1회.
-  - mapper가 레이어별로 (4×1)/(2×2)/(1×4) 중 최소 사이클 매핑 선택.
-- **Lockstep 규약**: 모든 태스크가 동일 수식(derive())으로 루프 경계를
-  파생하므로 스트림 생산/소비 개수가 구조적으로 일치 (reference_model.py가
-  스트림 잔량 assert로 검증). k1≥K1(KP 패딩)은 zero 가중치, p≥P(행그룹
-  꼬리)는 psum 소비 후 폐기.
-- **제약**: C1은 CP 배수로 호스트 패딩, CT1 ≤ C1/CP.
-- **멀티포트 IA 로더** (Phase 4c): 같은 DDR 버퍼를 가리키는 N_IA_PORTS(4)개
-  AXI 마스터로 C-슬라이스를 병렬 읽기 — 로더 시간이 CP에서
-  ceil(CP/4)로 축소. 반복당 포트별 1읽기 + PE 스트림별 정적 write 1개로
-  II=1 유지 (스트림 writer가 여러 개면 FIFO 포트 충돌로 II가 늘어남에 유의).
-  이 개선으로 mapper가 C-split(2×4, 1×8)을 적극 선택하게 됨.
+- **Spatial mapping** (runtime KP×CP=N_PES, Simba Listing 2's parallel_for):
+  - `KP` (K-split): PE groups own different k1 tiles. IA is **multicast**
+    (one DRAM read → KP streams) — IA traffic ÷KP vs a single PE.
+  - `CP` (C-split): PEs within a group share input-channel slices; their psums
+    are summed in gather = **Simba's cross-PE partial-sum reduction**. Bias is
+    added once, after the reduction.
+  - The mapper picks the fewest-cycle mapping per layer.
+- **Lockstep contract**: every task derives its loop bounds from the same
+  formulas (`derive()`), so stream production/consumption counts match by
+  construction (reference_model.py asserts on stream drain). k1≥K1 (KP padding)
+  sends zero weights; p≥P (row-group tail) is consumed and discarded.
+- **Constraints**: C1 is host-padded to a CP multiple; CT1 ≤ C1/CP.
+- **Multi-port IA loader** (Phase 4c): N_IA_PORTS (4) AXI masters all pointing at
+  the same DDR buffer read the C-slices in parallel — loader time scales as
+  ceil(CP/4) instead of CP. One read per port per iteration plus exactly one
+  static write per PE stream keeps II=1 (multiple static writers to a stream
+  cause FIFO port conflicts that raise II). This makes the mapper favor C-split
+  (2×4, 1×8).
 
-## 3.6 Global PE와 호스트 런타임 (Phase 3b)
+## 3.6 Global PE and host runtime (Phase 3b)
 
-Simba의 Global PE(2차 저장소 + 저재사용 연산 근접 처리)와 RISC-V 컨트롤러 대응:
+Maps to Simba's Global PE (second-level storage + near-memory low-reuse ops) and
+its RISC-V controller:
 
-- **`global_pe_top`** (hw/src/global_pe.cpp, 별도 HLS 컴포넌트):
-  - `GPE_ELTWISE`: O = sat(relu((A·multA + B·multB) ≫ shift)) — ResNet
-    residual add. 입력별 재양자화 스케일 지원, II=1 스트리밍.
-  - `GPE_MAXPOOL` / `GPE_AVGPOOL`: 윈도우 순회(II=1), 패딩 무시.
-    avg의 1/count는 호스트가 multA/shift에 반영 (global avgpool 포함).
-  - conv 커널과 동일한 NHWC 64b word 레이아웃 → **재패킹 없는 체이닝**.
-- **`sw/runtime/net_runner.h`**: Simba RISC-V 컨트롤러의 역할 —
-  레이어 시퀀서 + 커널 설정 계산. `plan_conv()`가 mapper의 사이클 모델을
-  미러하여 레이어별 KP/CP/CT1을 자동 선택한다 (체이닝 제약: 텐서 C1이
-  이전 레이어에서 고정되므로 C1 % CP != 0 후보는 제외). 현재는 커널 C 함수
-  직접 호출(csim 검증), Phase 4에서 호출부만 XRT enqueue로 교체.
-- **검증**: tb_global_pe(단위 7케이스) + tb_network(ResNet bottleneck 블록
-  e2e: conv×3 → residual add → maxpool → global avgpool, 전 스테이지 비트 일치).
+- **`global_pe_top`** (hw/src/global_pe.cpp, a separate HLS component):
+  - `GPE_ELTWISE`: O = sat(relu((A·multA + B·multB) ≫ shift)) — ResNet residual
+    add with per-input requantization scales, II=1 streaming.
+  - `GPE_MAXPOOL` / `GPE_AVGPOOL`: window walk (II=1), padding ignored. For avg
+    the 1/count folds into multA/shift (including global average pool).
+  - Same NHWC 64b-word layout as the conv kernel → **chaining without repacking**.
+- **`sw/runtime/net_runner.h`**: the RISC-V controller role — layer sequencer +
+  kernel configuration. `plan_conv()` mirrors the mapper's cycle model to pick
+  KP/CP/CT1 per layer (chaining constraint: the tensor's C1 is fixed by the
+  previous layer, so C1 % CP != 0 candidates are excluded). It calls the kernels
+  as C functions for csim; on the board the call sites become PYNQ MMIO or XRT
+  enqueues.
+- **Verification**: tb_global_pe (7 unit cases) + tb_network (ResNet
+  bottleneck-block e2e: conv×3 → residual add → maxpool → global avgpool,
+  bit-exact at every stage).
 
-## 4. 실행 흐름 (현재 구현)
+## 4. Execution flow
 
 ```
-k1 타일 루프:
-  load bias        : N_LANES 개
-  p1 (행 그룹) 루프:
-    c2 (채널 타일) 루프:
-      load_weights : (k1,c2) 타일을 lane별 뱅크로 burst 로드 (태그 캐시)
-      p0 루프 [HLS dataflow]:
-        load_ia_rows ‖ compute_row   # PIPO로 오버랩, II=1, 64 MAC/cycle
-    ppu_store_group: requant→ReLU→pack→DRAM (행 그룹 전체)
+k1 tile loop:
+  load bias + per-channel mult : N_LANES each
+  p1 (row group) loop:
+    c2 (channel tile) loop:
+      load_weights : burst the (k1,c2) tile into per-lane banks (tag cache)
+      p0 loop [HLS dataflow]:
+        load_ia_rows ‖ compute_row   # PIPO overlap, II=1
+    ppu_store_group: requant→ReLU→pack→DRAM (whole row group)
 ```
 
-알려진 잔여 비효율 (Phase 3에서 해결):
-1. **IA 행 재로드** — 인접 출력 행이 (R−stride)개 입력 행을 공유하지만 매번 재로드.
-   dataflow 오버랩으로 레이턴시에선 가려지지만 DRAM 대역폭/에너지는 ×R.
-   → 스트림 기반 라인 버퍼로 해결 (PIPO 구조 재설계 필요).
-2. **k1 루프마다 IA 전체 재로드** → 멀티 PE에서 IA multicast(Global PE)로 흡수.
-3. **P가 PT_ROWS 비배수일 때 꼬리 행 낭비, Q<16 패딩 낭비** — 작은 출력 레이어의
-   utilization 저하. → K/C 공간 분할(멀티 PE)이 근본 해결책.
+Residual inefficiencies (targeted by later phases):
+1. **IA row reload** — adjacent output rows share (R−stride) input rows but reload
+   them; the dataflow overlap hides the latency but DRAM bandwidth/energy is ×R.
+   Multi-PE multicast (Global PE) absorbs most of it.
+2. **PT_ROWS/Q<16 waste** — tail rows and short-Q padding lower utilization on
+   small output layers; K/C spatial splitting (multi-PE) is the fundamental fix.
 
 ---
 
-## 5. 로드맵
+## 5. Roadmap
 
-| Phase | 내용 | 상태 |
+| Phase | Scope | Status |
 |---|---|---|
-| **0** | 단일 PE OS-LWS conv 엔진 + 골든모델 TB + mapper | ✅ |
-| **2** | C-타일링, double buffering, DSP packing(2MAC/DSP) | ✅ |
-| **1** | Vitis csim/csynth 통과 (II=1, 200MHz, packing 확인) | ✅ (cosim은 보류) |
-| **3a** | PE 4개 dataflow + cross-PE reduction + KP×CP spatial 매핑 + 버퍼 Simba 스케일 축소 | ✅ (csim 36케이스 PASS) |
-| **3b** | Global PE(elementwise/pooling) + net_runner 호스트 런타임 + 네트워크 e2e 검증 | ✅ (csim/csynth 클린) |
-| **—** | cosim (RTL 시뮬레이션, 축소 TB 9런) | ✅ PASS (데드락 없음 확인) |
-| **4a** | **8 PE 확장** (512 MAC/cycle, ZU7EV 타깃) + gather (q,kp) flatten 재설계(N_PES 증가에도 리소스 평평) + XRT 호스트/링크 설정 딜리버러블 | ✅ |
-| **4c** | **멀티포트 IA 로더**(4포트, C-split 최대 4×) + **ResNet-50 전체 네트워크**(실크기 dry-run 53 conv + 축소 e2e 16블록) + **Tuner-lite**(sw/tuner/tuner.py, 설계공간 탐색) | ✅ |
-| **5** | **INT4 데이터패스**(-DUSE_INT4): W/IA/OA=4b, VECTOR_SIZE 8→16 → PE당 128 MAC/cycle(1024 total). 정밀도 매크로 일반화, 레이어 체이닝 word 계산 일반화 | ✅ (csim + int8/int4 회귀 PASS) |
-| **4b** | **Windows 네이티브 bitstream** (Vivado 클래식 플로우: HLS IP → BD → synth/impl, `build_vivado.tcl`) + PYNQ 호스트 드라이버 | ✅ (ZCU104 .bit 생성, 200MHz 타이밍 클린) — 실보드 구동만 대기 |
-| **4b-XRT** | (대안) Vitis v++ 링크 + XRT — Linux 호스트 필요 | 보류 |
-| **—** | Q>128 지원(W 타일링), per-vector 스케일(4b) | 향후 |
+| **0** | Single-PE OS-LWS conv engine + golden TB + mapper | ✅ |
+| **1** | Vitis csim/csynth pass (II=1, 200 MHz, packing) | ✅ |
+| **2** | C-tiling, double buffering, DSP packing (2 MAC/DSP) | ✅ |
+| **3a** | Multi-PE dataflow + cross-PE reduction + KP×CP mapping + Simba-scale buffers | ✅ (csim 36 cases) |
+| **3b** | Global PE (eltwise/pool) + net_runner runtime + network e2e | ✅ (csim/csynth clean) |
+| **—** | RTL cosim (reduced TB, 9 runs) | ✅ PASS (no deadlock) |
+| **4a** | 8-PE scale-up (512 MAC/cycle) + gather (q,kp) flatten redesign + XRT/link deliverables | ✅ |
+| **4c** | Multi-port IA loader + full ResNet-50 (53-conv dry run + reduced e2e) + Tuner-lite | ✅ |
+| **5** | INT4 datapath (-DUSE_INT4) + 16-PE build (incl. free-license ZCU104) | ✅ |
+| **4b** | Windows-native ZCU104 bitstream (classic Vivado flow) + PYNQ host | ✅ (.bit generated, timing clean; on-board bring-up pending) |
+| **6** | Real-weight ResNet-50 pipeline + per-channel PTQ | ✅ |
+| **—** | On-board execution; Q>128 (W-tiling); int4 per-vector scale / QAT | future |
 
-### INT4 구성 (Phase 5)
+### INT4 configuration (Phase 5)
 
-MAGNet의 대표 기능(4-bit로 성능/면적 개선)을 컴파일 스위치로 구현:
-- `-DUSE_INT4`: W_BITS/IA_BITS/OA_BITS=4, **VECTOR_SIZE 8→16**. 64b 메모리
-  word가 16개 요소를 담아 PE당 처리량 2배(128 MAC/cycle) → **1024 MAC/cycle
-  = 409.6 GOPS @ 200MHz**.
-- **DSP packing은 4-bit에서도 그대로 성립**: `(w1≪18+w0)·a`에서 |w0·a| ≤ 8·8
-  = 64 ≪ 2^17 이므로 borrow 보정 증명 불변. VECTOR_SIZE만 늘어 DOT2가 16회.
-- 포화 한계(OA_MAX/MIN)와 TB 값 범위(IA_RMAX 등)를 정밀도 매크로로 일반화.
-- **레이어 체이닝**: int4에서 OA word(8×4b=32b) ≠ IA word(16×4b=64b)이지만
-  바이트 스트림은 동일 — net_runner가 word 수를 `VECTOR_SIZE·IA_BITS /
-  (N_LANES·OA_BITS)` 비율로 환산(int8 ×1, int4 ×2). K는 VECTOR_SIZE 배수 요구.
-- 매퍼 추정 ResNet-50: int8 20.3ms → **int4 11.8ms**(고유 shape 1회 기준).
+MAGNet's headline feature (better perf/area at 4-bit) as a compile switch:
+- `-DUSE_INT4`: W_BITS/IA_BITS/OA_BITS=4, **VECTOR_SIZE 8→16**. The 64b word
+  carries 16 elements, doubling per-PE throughput (128 MAC/cycle) →
+  **1024 MAC/cycle = 409.6 GOPS @ 200 MHz** for 8 PEs.
+- **DSP packing still holds at 4-bit**: |w0·a| ≤ 8·8 = 64 ≪ 2^17, so the
+  borrow-correction proof is unchanged; only VECTOR_SIZE grows (DOT2 runs 16×).
+  Measured DSP is actually *lower* than int8 (small multiplies map to fabric).
+- Saturation bounds (OA_MAX/MIN) and TB value ranges (IA_RMAX, …) are derived
+  from the precision macros.
+- **Layer chaining**: at int4 the OA word (8×4b=32b) differs from the IA word
+  (16×4b=64b), but the byte stream is identical — net_runner converts word
+  counts by `VECTOR_SIZE·IA_BITS / (N_LANES·OA_BITS)` (×1 int8, ×2 int4). K must
+  be a VECTOR_SIZE multiple.
+- Mapper estimate for ResNet-50: int8 20.3 ms → **int4 11.8 ms** (unique shapes,
+  once each).
 
-**16 PE 구성** (`-DN_PES=16`): 기능 검증(모델 24/24, g++ int8/int4 36케이스)
-+ 합성 검증 완료. 디바이스 선택지 3가지 (합성 실측):
+### 16-PE configuration (`-DN_PES=16`)
 
-| 타깃 | 라이선스 | 조건 | BRAM/URAM/DSP/LUT | 비고 |
+Functionally verified (reference model 24/24, g++ int8/int4 36 cases each) and
+synthesized. Three device options (synthesis-measured):
+
+| Target | License | Condition | BRAM/URAM/DSP/LUT | Notes |
 |---|---|---|---|---|
-| **zu7ev (ZCU104)** | **무료** | `USE_URAM_ROWBUF` + `PT_ROWS=4` (`hls_config_pe16_zu7ev.cfg`) | **85% / 16% / 52% / 76%** | 성능 손실 없음(매퍼 34.8ms, PT8과 동일). LUT 76%라 P&R 타이밍 노력 필요 가능 |
-| xcku5p | 무료 | 기본 구성 그대로 | 82% / 0 / 50% / 81% | ARM PS 없음 → XRT 임베디드 플로우 불가, 보드 희소 |
-| zu9eg (ZCU102) | Enterprise | 기본 구성 (`hls_config_pe16.cfg`) | 43% / 0 / 36% / 63% | 가장 여유 |
+| **zu7ev (ZCU104)** | **free** | `USE_URAM_ROWBUF` + `PT_ROWS=4` (`hls_config_pe16_zu7ev.cfg`) | **85% / 16% / 52% / 76%** | no perf loss (mapper 34.8 ms); LUT 76% may need P&R timing effort |
+| xcku5p | free | default config | 82% / 0 / 50% / 81% | no ARM PS → different deployment; boards rare |
+| zu9eg (ZCU102) | Enterprise | default (`hls_config_pe16.cfg`) | 43% / 0 / 36% / 63% | most headroom |
 
-BRAM 절약 원리: rowbuf→URAM(-128 BRAM18), PT_ROWS 4(acc 뱅크가 BRAM36→
-BRAM18, -128). `mapper.py --pes 16 [--int4]`. 매퍼 추정(전체 네트워크):
-16 PE int8 ~28.8 fps, int4 조합 시 2048 MAC/cycle.
+BRAM savings: rowbuf→URAM (−128 BRAM18), PT_ROWS=4 (acc banks BRAM36→BRAM18,
+−128). `mapper.py --pes 16 [--int4]`. Estimated full-network throughput: 16 PE
+int8 ~28.8 fps; combine with int4 for 2048 MAC/cycle.
 
-### Windows 네이티브 배포 플로우 (Phase 4b, XRT 불필요)
+### Windows-native deployment flow (Phase 4b, no XRT)
 
-Vitis 가속 플로우(`v++ -l` + XRT)는 Linux 전용이지만, **클래식 Vivado 플로우는
-Windows에서 완결**된다:
-1. HLS csynth → 커널 IP (`build/hls/.../impl/ip`, `run_hls.ps1 synth`)
-2. `hw/scripts/build_vivado.tcl`: ZCU104 보드 프리셋 PS + 커널 + AXI
-   SmartConnect(데이터 7 마스터→HP0, 제어→HPM0) 블록디자인 → synth → impl →
-   `.bit` + `.xsa`. `VIV_BD_ONLY=1`로 BD만 빠르게 검증 가능.
-3. 보드에서 XRT 대신 **PYNQ**(`sw/host/pynq_host.py`)로 s_axilite 레지스터 맵
-   직접 구동 (레지스터 오프셋은 csynth 리포트). conv-only 비트스트림이라 pool/
-   eltwise는 ARM numpy 폴백(hybrid); global_pe_top을 KERNELS에 추가하면 전량 오프로드.
+The Vitis acceleration flow (`v++ -l` + XRT) is Linux-only, but the **classic
+Vivado flow completes on Windows**:
+1. HLS csynth → kernel IP (`build/hls/.../impl/ip`, `run_hls.ps1 synth`).
+2. `hw/scripts/build_vivado.tcl`: ZCU104 board-preset PS + kernel + AXI
+   SmartConnect (7 data masters → HP0, control → HPM0) block design → synth →
+   impl → `.bit` + `.xsa`. Set `VIV_BD_ONLY=1` to validate the block design
+   quickly first.
+3. On the board, drive the s_axilite register map directly with **PYNQ**
+   (`sw/host/pynq_host.py`) instead of XRT (register offsets from the csynth
+   report). The default bitstream is conv-only, so pooling/eltwise fall back to
+   the ARM in numpy (hybrid); add global_pe_top to KERNELS to offload them too.
 
-**실측 (xczu7ev, 8 PE, 200MHz)**: BRAM 55.6% / DSP 28.7% / LUT 26.8% /
-URAM 0%, **WNS +0.405ns (타이밍 met), DRC 0 errors**. .bit 19MB, .xsa 3.7MB.
+**Measured (xczu7ev, 8 PE, 200 MHz)**: BRAM 55.6% / DSP 28.7% / LUT 26.8% /
+URAM 0%, **WNS +0.405 ns (timing met), DRC 0 errors**. .bit 19 MB, .xsa 3.7 MB.
 
-### 참고 문헌 (resources/)
+### References (resources/)
 - MAGNet: A Modular Accelerator Generator for Neural Networks — ICCAD 2019
-- Simba: Scaling DL Inference with MCM-Based Architecture — MICRO 2019 (Phase 3 시스템 레벨)
+- Simba: Scaling DL Inference with MCM-Based Architecture — MICRO 2019 (system level)
 - Buffets: An Efficient and Composable Storage Idiom — ASPLOS 2019 (+ `buffets-master/` RTL)
-- Sze et al., Efficient Processing of Deep Neural Networks (dataflow 분류 체계)
+- Sze et al., Efficient Processing of Deep Neural Networks (dataflow taxonomy)

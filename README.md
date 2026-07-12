@@ -1,150 +1,156 @@
-# Efficient AI CNN Accelerator (MAGNet-style, AMD Vitis HLS)
+# Efficient Low-Energy CNN Accelerator (MAGNet/Simba-style, AMD Vitis HLS)
 
-NVIDIA **MAGNet** (ICCAD 2019) 논문의 모듈형 가속기 템플릿을 AMD Vitis HLS로
-구현하는 프로젝트. `resources/`의 논문들(MAGNet, Simba, Buffets, Sze 교과서)을
-설계 근거로 삼는다. 상세 설계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 참조.
+An int8/int4 CNN inference accelerator for AMD Zynq UltraScale+ (ZCU104),
+modeled on NVIDIA's **MAGNet** (ICCAD 2019) configurable PE template and
+**Simba** (MICRO 2019) multi-chip system. Design references live in
+`resources/` (MAGNet, Simba, Buffets, and Sze's *Efficient Processing of DNNs*).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
-## 현재 상태 (Phase 4a까지 완료)
+The toolchain is closed **end to end on Windows**: PyTorch weights → PTQ export
+→ HLS → csim/cosim → ZCU104 bitstream (timing clean). Only running on physical
+hardware remains.
 
-- ✅ **PE 8개 멀티 PE 시스템** (Simba chiplet 구조): IA multicast 로더 + W 분배
-  로더 + PE×8 + **cross-PE reduction**(gather) — HLS dataflow 태스크 파이프라인.
-  **512 MAC/cycle = 204.8 GOPS @ 200MHz**, ZU7EV에 BRAM 63%/DSP 28%/LUT 47%
-- ✅ **런타임 spatial 매핑** KP×CP: K-split(8×1)/혼합(4×2)/C-split(1×8),
-  mapper가 레이어별 자동 선택. gather는 (q,kp) flatten II=1 구조라
-  N_PES를 키워도 리소스가 늘지 않음
-- ✅ **16 PE 구성** (`-DN_PES=16`): **무료 라이선스 ZCU104에서 합성 성공** —
-  `hls_config_pe16_zu7ev.cfg` (rowbuf→URAM + PT_ROWS=4): BRAM 85%/URAM 16%/
-  DSP 52%/LUT 76%, II=1, 성능 손실 없음(~28.8 fps 추정). 대안: xcku5p(무료,
-  PS 없음), zu9eg(여유, Enterprise). `mapper.py --pes 16`
-- ✅ PE 내부: OS-LWS 데이터플로우, C-타일링, DSP packing(2MAC/DSP, 전수 검증)
-- ✅ **Vitis 2026.1 csim 통과**: 12 레이어 × 3 spatial = 36 케이스 골든 일치.
-  16 PE 구성도 알고리즘 검증 완료(모델 24/24) — zu9eg + Enterprise 라이선스
-  환경이면 config 두 줄로 확장
-- ✅ Python 레퍼런스 모델이 스트림 생산/소비 개수까지 검증 (데드락 방지)
-- ✅ Mapper: ResNet-50 추정 **~19.8ms/img** (8 PE; 4 PE 36.4ms, 단일 PE 191ms)
-- ✅ **멀티포트 IA 로더** (4× AXI 마스터, 같은 버퍼 별칭): C-split 로더 시간이
-  CP → ceil(CP/4)로 축소, IA_SEND II=1 유지. mapper가 C-split을 적극 선택
-- ✅ **ResNet-50 전체 네트워크**: 실제 크기 53개 conv 전부 유효 매핑
-  (dry-run, ~77ms = 13 fps 추정) + 축소 해상도(32×32, 실제 채널 폭) 16개
-  bottleneck 블록 e2e 비트 일치 (`run_hls.ps1 resnet`)
-- ✅ **Tuner-lite** (`sw/tuner/tuner.py`): 설계공간 탐색 — 현재 구성(8 PE,
-  wbuf 256, qmax 128)이 zu7ev에서 Pareto 최적임을 확인
-- ✅ **INT4 구성** (`-DUSE_INT4`): W/IA/OA 4-bit + VECTOR_SIZE 16 → **1024
-  MAC/cycle = 409.6 GOPS**. int8/int4 양쪽 회귀 PASS(g++ + Vitis csim),
-  ResNet-50 추정 int8 20ms → int4 12ms. `run_hls.ps1 int4-csim|int4-synth`,
-  `mapper.py --int4`
-- ✅ **실가중치 파이프라인 end-to-end**: `sw/quant/export_resnet50.py`(사전학습
-  ResNet-50 → BN 폴딩 → PTQ → mult/shift → 가속기 레이아웃 export, int8
-  self-check top-1 4/4) + `hw/tb/tb_resnet50_real.cpp`(manifest/바이너리
-  로더 → net_runner → 커널 실행). **실제 224×224 ResNet-50 전체(72레이어,
-  fc 포함)가 커널 경로에서 Python 정수 시뮬레이션과 비트 일치, logits
-  0/1000 불일치** (`run_hls.ps1 real`)
-- ✅ **실이미지 검증** (fruits262에서 48장 샘플링, `fetch_calib_images.py`):
-  실이미지 캘리브레이션 + **percentile 클리핑(기본 99.99, 스윕 결과 최적)**
-  으로 **양자화 충실도 top-1 11/16, float-top1 ∈ int8-top5 16/16**
-  (abs-max 10/16, 99.9는 과도 클리핑으로 7/16). 커널 경로 실이미지 분류도
-  비트 일치
-- ✅ **per-channel weight 양자화** (HW: gather에 per-lane mult 테이블
-  `gmem_mult[Kpad]`, **DSP 증가 0**): **양자화 충실도 top-1 14/16**
-  (per-tensor 11/16 → +3), top-5 16/16. swc 하한(max/256)으로 bias int32
-  오버플로 방지. 커널 경로 비트 일치·csim 36/36·csynth 리소스 불변.
-  int4 개선은 per-vector 스케일/QAT (향후)
-- ✅ **Windows 네이티브 bitstream 생성** (Vivado 클래식 플로우, XRT/Linux 불필요):
-  `hw/scripts/build_vivado.tcl` — HLS IP → ZCU104 블록디자인(PS+커널+AXI
-  SmartConnect) → synth/impl → `.bit`+`.xsa`. **실측 xczu7ev 8 PE: BRAM 56%/
-  DSP 29%/LUT 27%, WNS +0.405ns(200MHz 클린), DRC 0 errors**. 보드 구동은
-  `sw/host/pynq_host.py`(PYNQ, s_axilite 레지스터 직접 제어, conv=FPGA·pool/
-  eltwise=ARM hybrid). Vitis/XRT 경로(`xrt_host.cpp`+`system.cfg`)는 Linux용 대안
-- ℹ 제약: Q ≤ 128 (ResNet-50 전 레이어 커버; VGG-224급은 W 타일링 필요),
-  KP/CP는 2의 거듭제곱
-- ✅ **Global PE** (`global_pe_top`, 별도 커널): residual add(eltwise, 스케일별
-  재양자화)·maxpool·avgpool — csim/csynth 클린 (II=1)
-- ✅ **호스트 런타임** (`sw/runtime/net_runner.h`): 레이어 시퀀서 + C++판
-  매퍼(plan_conv). **ResNet bottleneck 블록 e2e** (conv×3 → residual →
-  maxpool → global avgpool) 전 스테이지 비트 일치
-- ✅ **RTL co-simulation PASS** — 축소 TB(3 레이어 × 3 spatial = 9런)로 XSIM
-  실행, 전부 비트 일치. 유한 스트림 depth의 RTL에서 완주 = **데드락 부재 확인**
+## Highlights
 
-## 폴더 구조
+- **8-PE multi-PE system** (Simba chiplet structure): IA multicast loader +
+  weight loader + 8×PE + cross-PE reduction (gather) as an HLS dataflow
+  pipeline. **512 MAC/cycle = 204.8 GOPS @ 200 MHz** (int8); BRAM 56% / DSP 29%
+  / LUT 27% on xczu7ev.
+- **Runtime spatial mapping** KP×CP — K-split (8×1) / mixed (4×2) / C-split
+  (1×8), chosen per layer by the mapper. Gather uses a flattened (q,kp) II=1
+  loop, so resources stay flat as N_PES grows.
+- **16-PE build fits the free-license ZCU104** — `hls_config_pe16_zu7ev.cfg`
+  (row buffers → URAM + `PT_ROWS=4`): BRAM 85% / URAM 16% / DSP 52% / LUT 76%,
+  all MAC loops II=1, no performance loss (~28.8 fps est.). Alternatives:
+  xcku5p (free, no ARM PS) or zu9eg/ZCU102 (roomy, Enterprise license).
+- **INT4 configuration** (`-DUSE_INT4`): W/IA/OA 4-bit + VECTOR_SIZE 16 →
+  **1024 MAC/cycle = 409.6 GOPS** per 8 PEs, with *fewer* DSPs than int8
+  (small multiplies map to fabric). int8 and int4 both regress clean.
+- **Real-weight pipeline** — `sw/quant/export_resnet50.py` (pretrained ResNet-50
+  → BN folding → per-channel PTQ → accelerator layout). The **full 224×224
+  ResNet-50 (72 layers incl. fc)** runs through the kernels bit-exactly against
+  an integer reference (logits 0/1000 mismatches). Quantization fidelity vs the
+  float model on 16 real images: **top-1 14/16, float-top1 within int8 top-5
+  16/16** (per-channel + percentile calibration).
+- **Windows-native bitstream** — `hw/scripts/build_vivado.tcl` (classic Vivado
+  flow, no XRT/Linux): HLS IP → ZCU104 block design → synth/impl → `.bit`+`.xsa`.
+  Measured: **WNS +0.405 ns (200 MHz met), DRC 0 errors**. Board bring-up via
+  `sw/host/pynq_host.py` (PYNQ, drives the s_axilite register map directly).
+- **Verified** at every level: bit-exact Python reference model (incl. stream
+  deadlock checks), g++ testbenches, Vitis csim, csynth (all MAC loops II=1),
+  and RTL cosim (9 runs pass).
+
+## Repository layout
 
 ```
 hw/
-  include/accel_config.h   # 설계시점 파라미터 (VectorSize, NLanes, N_PES, 버퍼, 정밀도)
-  include/accel_types.h    # ap_int/hls_stream 타입 (없으면 표준 타입 대체)
-  include/magnet_top.h     # conv 커널 선언 + DRAM 레이아웃 규약
-  include/global_pe.h      # Global PE 커널 선언 (eltwise/pool)
-  src/magnet_top.cpp       # 멀티 PE conv 시스템 (loader/PE×4/gather dataflow)
-  src/global_pe.cpp        # Global PE (residual add, maxpool, avgpool)
-  src/archive/             # 이전 Phase 구현 보관
-  tb/tb_conv.cpp           # conv 커널 TB (골든 비교, 12케이스 × 3 spatial)
-  tb/tb_global_pe.cpp      # Global PE TB (7케이스)
-  tb/tb_network.cpp        # 네트워크 e2e TB (ResNet bottleneck 블록)
-  scripts/run_hls.ps1      # 빌드 래퍼 (csim/synth/gpe-*/gcc/net)
-  scripts/hls_config*.cfg  # Vitis 통합 플로우 설정 (커널별)
+  include/accel_config.h    # design-time params (VECTOR_SIZE, N_LANES, N_PES, buffers, precision)
+  include/accel_types.h     # ap_int/hls_stream types (fall back to std types off-tool)
+  include/magnet_top.h      # conv kernel decl + DRAM layout contract
+  include/global_pe.h       # Global PE kernel decl (eltwise/pool)
+  src/magnet_top.cpp        # multi-PE conv system (loader / PE×N / gather dataflow)
+  src/global_pe.cpp         # Global PE (residual add, maxpool, avgpool)
+  src/archive/              # earlier-phase implementations (reference only)
+  tb/tb_conv.cpp            # conv kernel TB (golden compare, 12 cases × 3 spatial)
+  tb/tb_global_pe.cpp       # Global PE TB
+  tb/tb_network.cpp         # network e2e TB (ResNet bottleneck block)
+  tb/tb_resnet50.cpp        # full ResNet-50 dry run + reduced-size e2e
+  tb/tb_resnet50_real.cpp   # real quantized weights through the kernels
+  scripts/build_vivado.tcl  # classic Vivado flow -> bitstream (Windows)
+  scripts/run_hls.ps1       # HLS build wrapper (csim/synth/cosim/gpe-*/int4-*/pe16-*/gcc/net/resnet/real)
+  scripts/hls_config*.cfg   # Vitis unified-flow configs (per kernel/target)
 sw/
-  quant/export_resnet50.py # 사전학습 ResNet-50 PTQ → 가속기 레이아웃 export
-  quant/calib/             # 캘리브레이션 이미지 폴더 (.jpg를 넣으면 사용)
-  mapper/mapper.py         # MAGNet Mapper (spatial/타일 선택 + 사이클/트래픽 모델)
-  model/reference_model.py # 비트-정확 Python 모델 (스트림 개수 검증 포함)
-  runtime/net_runner.h     # 레이어 시퀀서 + plan_conv (Phase 4에서 XRT로 교체)
-docs/ARCHITECTURE.md       # 설계 문서 (MAGNet/Simba 대응표, dataflow, 로드맵)
-resources/                 # 참고 논문 및 Buffets RTL
+  quant/export_resnet50.py  # pretrained ResNet-50 PTQ -> accelerator layout export
+  quant/fetch_calib_images.py # sample fruits262 calibration images via kagglehub
+  mapper/mapper.py          # MAGNet Mapper (spatial/tile selection + cycle/traffic model)
+  tuner/tuner.py            # design-space exploration (MAGNet Tuner-lite)
+  model/reference_model.py  # bit-exact Python model (with stream-count checks)
+  runtime/net_runner.h      # layer sequencer + plan_conv (C++ mirror of the mapper)
+  host/pynq_host.py         # board driver (PYNQ, XRT-free)
+  host/xrt_host.cpp         # board driver (XRT, Linux) — alternative
+docs/ARCHITECTURE.md        # design doc (MAGNet/Simba mapping, dataflow, roadmap)
+resources/                  # reference papers and Buffets RTL (git-ignored)
 ```
 
-## 요구 환경
+## Requirements
 
-- **AMD Vivado/Vitis 2026.1** — 설치 확인: `C:\AMDDesignTools\2026.1`
-  - 2024.2+에는 클래식 `vitis_hls`가 없고 **통합 플로우**(`v++ --mode hls`, `vitis-run`)만 있음
-  - **무료 라이선스 활성화 필요** (아래 참조). 미활성화 시 `gcc` 모드로 TB 검증은 가능
-  - 설치된 디바이스: xczu7ev(ZCU104)·xczu9eg·xczu19eg — KV260(xck26)은 미설치라
-    현재 타깃은 **ZCU104** (`hw/scripts/hls_config.cfg`의 `part=`로 변경)
-- Python 3.10+ (mapper / reference model)
+- **AMD Vivado/Vitis 2026.1**. From 2024.2 the classic `vitis_hls` binary is
+  gone; the HLS scripts use the unified flow (`v++ --mode hls`, `vitis-run`).
+  A free license is needed for csim/synth/cosim (see below); without it the
+  `gcc` mode still runs the testbenches with the bundled g++ + real ap_int headers.
+- Default target: **ZCU104** (`xczu7ev-ffvc1156-2-e`); change `part=` in the
+  `hls_config*.cfg` files for other boards.
+- Python 3.10+ for the mapper / reference model / quantization pipeline
+  (PyTorch + torchvision only for `export_resnet50.py`).
 
-### 무료 라이선스 활성화 (1회)
+### Free license activation (once)
 
-2025.1부터 무료 Standard Edition도 라이선스 파일이 필요하다:
-1. https://account.amd.com/en/licenses 로그인 (AMD 계정)
-2. "Vivado/Vitis Standard Edition" 무료 라이선스 생성 — Host ID는 이더넷 MAC
-   (`Get-NetAdapter`로 확인, 이 PC: `34-5A-60-BE-67-C7`)
-3. 받은 `Xilinx.lic`를 `C:\Users\<사용자>\.Xilinx\Xilinx.lic` 에 저장
+Since 2025.1 the free Standard Edition also needs a license file:
+1. Sign in at https://account.amd.com/en/licenses (AMD account).
+2. Generate a "Vivado/Vitis Standard Edition" free license — the Host ID is the
+   Ethernet MAC (`Get-NetAdapter`).
+3. Save the `Xilinx.lic` to `C:\Users\<user>\.Xilinx\Xilinx.lic` and point
+   `XILINXD_LICENSE_FILE` at it.
 
-## Quick Start
+## Quick start
 
 ```powershell
-# 1) 알고리즘 검증 (Vitis/라이선스 없이 즉시 실행 가능)
+# 1) Algorithm check (no Vitis/license needed)
 python sw\model\reference_model.py
 
-# 2) 매핑 확인
-python sw\mapper\mapper.py --network resnet50
-python sw\mapper\mapper.py --layer 56,56,64,64,3,3,1,1
+# 2) Mapping / performance estimates
+python sw\mapper\mapper.py --network resnet50            # 8 PE int8
+python sw\mapper\mapper.py --network resnet50 --pes 16 --int4
 
-# 3) TB 실행 — 번들 g++ + 실제 ap_int 헤더 (라이선스 불필요, 13케이스 PASS 확인됨)
-.\hw\scripts\run_hls.ps1 gcc
+# 3) Testbenches via the bundled g++ + real ap_int headers (no license)
+.\hw\scripts\run_hls.ps1 gcc        # conv kernel, 36 cases
+.\hw\scripts\run_hls.ps1 net        # ResNet bottleneck-block e2e
 
-# 4) HLS (라이선스 활성화 후)
-.\hw\scripts\run_hls.ps1 csim    # C simulation
-.\hw\scripts\run_hls.ps1 synth   # 합성 리포트 (II=1, 리소스, 타이밍)
-.\hw\scripts\run_hls.ps1 cosim   # RTL co-simulation
+# 4) HLS flow (after license activation)
+.\hw\scripts\run_hls.ps1 csim       # C simulation
+.\hw\scripts\run_hls.ps1 synth      # synthesis report (II=1, resources, timing)
+.\hw\scripts\run_hls.ps1 cosim      # RTL co-simulation
+
+# 5) Real quantized ResNet-50 through the kernels
+python sw\quant\fetch_calib_images.py --n 48    # calibration images (optional)
+python sw\quant\export_resnet50.py              # PTQ export -> sw/quant/export
+.\hw\scripts\run_hls.ps1 real                   # run it through the kernels
+
+# 6) Windows bitstream (after run_hls.ps1 synth produces the IP)
+& 'C:\AMDDesignTools\2026.1\Vivado\bin\vivado.bat' -mode batch -source hw/scripts/build_vivado.tcl
 ```
 
-(구버전 Vitis(≤2024.1)용 Tcl 스크립트는 `hw/scripts/run_hls.tcl` 참조)
+(For legacy Vitis ≤2024.1, see `hw/scripts/run_hls.tcl`.)
 
-## 설계 요약
+## Design summary
 
-MAGNet의 3계층 컴퓨트 구조를 따른다:
-**Vector MAC** (VECTOR_SIZE=8 dot product) × **N_LANES=8** → 64 MAC/cycle PE.
-입력채널(C)을 VectorSize로, 출력채널(K)을 NLanes로 공간 매핑하고,
-논문에서 에너지 최적으로 보고된 **OS-LWS** 순서(가중치를 q 루프 동안 고정 재사용,
-partial sum은 accumulation buffer에서 read-modify-write)로 시간 매핑한다.
-PPU가 bias·requantize(int8)·ReLU를 수행해 레이어 융합을 지원한다.
+Three-tier compute hierarchy from MAGNet: a **Vector MAC** (VECTOR_SIZE-wide
+dot product) × **N_LANES** lanes forms one PE; N_PES PEs form the array. The
+input-channel dimension (C) maps spatially to VectorSize and the output-channel
+dimension (K) to NLanes. Temporally the PE uses the **OS-LWS** order the paper
+reports as most energy-efficient: weights stay fixed across the innermost output
+loop while partial sums are read-modify-written in the accumulation buffer. A
+post-processing unit does bias + int8/int4 requantization + ReLU for layer
+fusion, with per-output-channel requant multipliers for accuracy. On top of the
+PE array sit the Simba-style system pieces: multicast IA loader, cross-PE
+partial-sum reduction, a Global PE (residual add / pooling), and a host runtime
+that sequences layers and picks each layer's spatial mapping.
 
-## 로드맵
+## Roadmap
 
-| Phase | 내용 |
-|---|---|
-| 0 ✅ | 단일 PE 엔진 + 검증 인프라 |
-| 2 ✅ | C-타일링, double buffering(PIPO), DSP packing |
-| 1 | Vitis csim/csynth/cosim 통과, II=1·200MHz 확인 |
-| 3a | PE 4개 + cross-PE reduction + K/C spatial 매핑 (Simba 방향) |
-| 3b | Global PE (multicast, elementwise/pooling), PS 호스트 런타임 |
-| 4 | 16 PE + KV260 보드 통합 (XRT), ResNet-50 end-to-end, INT4 탐색 (Tuner) |
+| Phase | Scope | Status |
+|---|---|---|
+| 0 | Single-PE OS-LWS conv engine + verification infra | ✅ |
+| 1 | Vitis csim/csynth/cosim, II=1 @ 200 MHz | ✅ |
+| 2 | C-tiling, double buffering (dataflow PIPO), DSP packing | ✅ |
+| 3a | Multi-PE + cross-PE reduction + KP×CP spatial mapping | ✅ |
+| 3b | Global PE (eltwise/pool) + host runtime + network e2e | ✅ |
+| 4a | 8-PE scale-up + gather redesign + XRT/link deliverables | ✅ |
+| 4b | Windows-native ZCU104 bitstream + PYNQ host | ✅ (bring-up on real HW pending) |
+| 4c | Multi-port IA loader + full ResNet-50 + Tuner-lite | ✅ |
+| 5 | INT4 datapath + 16-PE build (incl. free-license ZCU104) | ✅ |
+| 6 | Real-weight ResNet-50 pipeline + per-channel PTQ | ✅ |
+| — | On-board execution; int4 fidelity (per-vector scale / QAT) | future |
+
+**Constraints:** Q ≤ 128 (covers every ResNet-50 layer; VGG-224 would need
+W-tiling); KP and CP are powers of two.
