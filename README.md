@@ -29,9 +29,11 @@ hardware remains.
   accuracy** needs QAT, not PTQ: per-channel/per-vector PTQ leaves int4 at
   top-1 0/16 (activation resolution is the bottleneck — shown by
   `sw/quant/vsq_probe.py`), while label-free distillation QAT
-  (`sw/quant/qat_resnet50.py`, fake-quant matched to the datapath) recovers it
-  — a trivial 48-image/3-epoch CPU run already lifts teacher-agreement 0%→33%
-  with monotonically falling loss. Full recovery needs ImageNet + a GPU.
+  (`sw/quant/qat_resnet50.py`, fake-quant matched to the datapath) recovers it.
+  On an RTX 5060 (CUDA 12.8, Blackwell) a 6k-image/6-epoch run lifts held-out
+  teacher-agreement 9% to ~65% with monotonically falling loss (1.14 to 0.49).
+  Trained here on fruits262 (a narrow distribution); ImageNet-diverse data plus
+  final-fc precision handling would push it further and generalize.
 - **Real-weight pipeline** — `sw/quant/export_resnet50.py` (pretrained ResNet-50
   → BN folding → per-channel PTQ → accelerator layout). The **full 224×224
   ResNet-50 (72 layers incl. fc)** runs through the kernels bit-exactly against

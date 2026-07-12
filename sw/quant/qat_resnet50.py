@@ -57,8 +57,11 @@ class QConv2d(nn.Module):
         self.act_calibrated = False
 
     def calibrate_act(self, x, pct=99.99):
-        a = torch.quantile(x.abs().flatten().float(),
-                           torch.tensor(pct / 100.0))
+        v = x.detach().abs().flatten().float()
+        if v.numel() > 200000:                     # subsample: quantile sorts
+            idx = torch.randint(0, v.numel(), (200000,), device=v.device)
+            v = v[idx]
+        a = torch.quantile(v, torch.tensor(pct / 100.0, device=v.device))
         self.act_scale.data.fill_(float(a) / self.qmax + 1e-8)
         self.act_calibrated = True
 
@@ -89,24 +92,44 @@ def quantize_model(model, bits):
 # ---------------------------------------------------------------------------
 # data: unlabeled images -> preprocessed tensors (no labels needed)
 # ---------------------------------------------------------------------------
+from torchvision import transforms as _T
+
+_TFM = _T.Compose([
+    _T.Resize(256), _T.CenterCrop(224), _T.ToTensor(),
+    _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+
+
+class ImageSet(torch.utils.data.Dataset):
+    """Unlabeled image dataset (module-level for Windows DataLoader workers)."""
+
+    def __init__(self, paths):
+        self.paths = paths
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        from PIL import Image
+        return _TFM(Image.open(self.paths[i]).convert("RGB"))
+
+
 def load_batch(paths):
-    from PIL import Image
-    from torchvision import transforms
-    tfm = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])])
-    xs = []
-    for p in paths:
-        xs.append(tfm(Image.open(p).convert("RGB")))
-    return torch.stack(xs)
+    return torch.stack([ImageSet(paths)[i] for i in range(len(paths))])
 
 
 def image_paths(d, limit=None):
-    fs = [os.path.join(d, f) for f in sorted(os.listdir(d))
-          if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    return fs[:limit] if limit else fs
+    # recurse (fruits262 stores images in per-class subdirs)
+    fs = []
+    for root, _dirs, files in os.walk(d):
+        for f in files:
+            if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                fs.append(os.path.join(root, f))
+    fs.sort()
+    if limit and len(fs) > limit:
+        # evenly spaced subsample across the (class-sorted) list for diversity
+        step = len(fs) // limit
+        fs = fs[::step][:limit]
+    return fs
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +143,10 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--temp", type=float, default=4.0, help="distill temp")
     ap.add_argument("--save", default=None)
+    ap.add_argument("--limit", type=int, default=None,
+                    help="cap number of training images (subsampled evenly)")
+    ap.add_argument("--eval-every", type=int, default=1,
+                    help="report teacher/student agreement every N epochs")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny CPU run: 16 images, 8 steps, wiring/loss check")
     args = ap.parse_args()
@@ -136,33 +163,52 @@ def main():
     student = torchvision.models.resnet50(weights=w)
     student = quantize_model(student, args.bits).to(dev)
 
-    paths = image_paths(args.data, limit=16 if args.smoke else None)
-    if not paths:
-        raise SystemExit(f"no images in {args.data}")
+    all_paths = image_paths(args.data, limit=16 if args.smoke else args.limit)
+    if len(all_paths) < 8:
+        raise SystemExit(f"need >=8 images in {args.data}, found {len(all_paths)}")
+    # held-out eval split (last 10%, capped) to measure generalization
+    n_eval = min(64, max(4, len(all_paths) // 10))
+    eval_paths = all_paths[-n_eval:]
+    paths = all_paths[:-n_eval]
     epochs = 1 if args.smoke else args.epochs
     max_steps = 8 if args.smoke else 10 ** 9
-    print(f"{len(paths)} images, {epochs} epoch(s), batch {args.batch}, "
-          f"int{args.bits} QAT via distillation")
+    print(f"{len(paths)} train + {len(eval_paths)} eval images, "
+          f"{epochs} epoch(s), batch {args.batch}, int{args.bits} QAT distill")
+
+    use_cuda = dev.type == "cuda"
+    loader = torch.utils.data.DataLoader(
+        ImageSet(paths), batch_size=args.batch, shuffle=True,
+        num_workers=4 if use_cuda else 0, pin_memory=use_cuda, drop_last=True)
+
+    def eval_agree():
+        student.eval()
+        agree = 0
+        with torch.no_grad():
+            for i in range(0, len(eval_paths), args.batch):
+                x = load_batch(eval_paths[i:i + args.batch]).to(dev)
+                agree += int((teacher(x).argmax(1) ==
+                              student(x).argmax(1)).sum())
+        student.train()
+        return agree
 
     # calibration pass (sets activation scales) — one batch, no grad
     student.eval()
     with torch.no_grad():
         student(load_batch(paths[:args.batch]).to(dev))
+    print(f"before training: eval agreement {eval_agree()}/{len(eval_paths)}")
 
     opt = torch.optim.Adam([p for p in student.parameters()
                             if p.requires_grad], lr=args.lr)
     student.train()
+    T = args.temp
     step = 0
     for ep in range(epochs):
-        order = np.random.permutation(len(paths))
         losses = []
-        for i in range(0, len(paths) - args.batch + 1, args.batch):
-            idx = order[i:i + args.batch]
-            x = load_batch([paths[j] for j in idx]).to(dev)
+        for x in loader:
+            x = x.to(dev, non_blocking=use_cuda)
             with torch.no_grad():
                 t_logits = teacher(x)
             s_logits = student(x)
-            T = args.temp
             loss = F.kl_div(F.log_softmax(s_logits / T, 1),
                             F.softmax(t_logits / T, 1),
                             reduction="batchmean") * (T * T)
@@ -173,24 +219,16 @@ def main():
             step += 1
             if step >= max_steps:
                 break
-        print(f"epoch {ep + 1}: distill KL loss "
-              f"{losses[0]:.4f} -> {losses[-1]:.4f} "
-              f"(mean {np.mean(losses):.4f}, {len(losses)} steps)")
+        ea = eval_agree()
+        print(f"epoch {ep + 1}: KL loss mean {np.mean(losses):.4f} "
+              f"(last {losses[-1]:.4f}, {len(losses)} steps) | "
+              f"eval agreement {ea}/{len(eval_paths)}")
+        if args.save:
+            torch.save(student.state_dict(), args.save)
         if step >= max_steps:
             break
 
-    # quick agreement check on the training images (teacher vs student top-1)
-    student.eval()
-    agree = 0
-    with torch.no_grad():
-        for i in range(0, len(paths), args.batch):
-            x = load_batch(paths[i:i + args.batch]).to(dev)
-            agree += int((teacher(x).argmax(1) == student(x).argmax(1)).sum())
-    print(f"teacher/student top-1 agreement on {len(paths)} train images: "
-          f"{agree}/{len(paths)}")
-
     if args.save:
-        torch.save(student.state_dict(), args.save)
         print(f"saved QAT weights -> {args.save} "
               f"(load into resnet50 + export_resnet50.py to deploy)")
 
