@@ -25,7 +25,13 @@ hardware remains.
   xcku5p (free, no ARM PS) or zu9eg/ZCU102 (roomy, Enterprise license).
 - **INT4 configuration** (`-DUSE_INT4`): W/IA/OA 4-bit + VECTOR_SIZE 16 →
   **1024 MAC/cycle = 409.6 GOPS** per 8 PEs, with *fewer* DSPs than int8
-  (small multiplies map to fabric). int8 and int4 both regress clean.
+  (small multiplies map to fabric). int8 and int4 both regress clean. **int4
+  accuracy** needs QAT, not PTQ: per-channel/per-vector PTQ leaves int4 at
+  top-1 0/16 (activation resolution is the bottleneck — shown by
+  `sw/quant/vsq_probe.py`), while label-free distillation QAT
+  (`sw/quant/qat_resnet50.py`, fake-quant matched to the datapath) recovers it
+  — a trivial 48-image/3-epoch CPU run already lifts teacher-agreement 0%→33%
+  with monotonically falling loss. Full recovery needs ImageNet + a GPU.
 - **Real-weight pipeline** — `sw/quant/export_resnet50.py` (pretrained ResNet-50
   → BN folding → per-channel PTQ → accelerator layout). The **full 224×224
   ResNet-50 (72 layers incl. fc)** runs through the kernels bit-exactly against
@@ -63,6 +69,9 @@ hw/
   scripts/hls_config*.cfg   # Vitis unified-flow configs (per kernel/target)
 sw/
   quant/export_resnet50.py  # pretrained ResNet-50 PTQ -> accelerator layout export
+  quant/classify.py         # image -> ImageNet class (sim or FPGA backend)
+  quant/qat_resnet50.py     # int4 quantization-aware training (distillation, no labels)
+  quant/vsq_probe.py        # per-vector-scale experiment (why int4 needs QAT)
   quant/fetch_calib_images.py # sample fruits262 calibration images via kagglehub
   mapper/mapper.py          # MAGNet Mapper (spatial/tile selection + cycle/traffic model)
   tuner/tuner.py            # design-space exploration (MAGNet Tuner-lite)
