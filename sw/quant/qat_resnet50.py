@@ -166,8 +166,10 @@ def main():
     all_paths = image_paths(args.data, limit=16 if args.smoke else args.limit)
     if len(all_paths) < 8:
         raise SystemExit(f"need >=8 images in {args.data}, found {len(all_paths)}")
-    # held-out eval split (last 10%, capped) to measure generalization
-    n_eval = min(64, max(4, len(all_paths) // 10))
+    # shuffle before splitting so train/eval both span classes (images are
+    # stored in per-class subdirs; a sorted tail would be one class)
+    np.random.default_rng(0).shuffle(all_paths)
+    n_eval = min(256, max(4, len(all_paths) // 10))
     eval_paths = all_paths[-n_eval:]
     paths = all_paths[:-n_eval]
     epochs = 1 if args.smoke else args.epochs
