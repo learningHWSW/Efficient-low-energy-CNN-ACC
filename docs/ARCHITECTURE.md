@@ -205,7 +205,8 @@ k1 타일 루프:
 | **4a** | **8 PE 확장** (512 MAC/cycle, ZU7EV 타깃) + gather (q,kp) flatten 재설계(N_PES 증가에도 리소스 평평) + XRT 호스트/링크 설정 딜리버러블 | ✅ |
 | **4c** | **멀티포트 IA 로더**(4포트, C-split 최대 4×) + **ResNet-50 전체 네트워크**(실크기 dry-run 53 conv + 축소 e2e 16블록) + **Tuner-lite**(sw/tuner/tuner.py, 설계공간 탐색) | ✅ |
 | **5** | **INT4 데이터패스**(-DUSE_INT4): W/IA/OA=4b, VECTOR_SIZE 8→16 → PE당 128 MAC/cycle(1024 total). 정밀도 매크로 일반화, 레이어 체이닝 word 계산 일반화 | ✅ (csim + int8/int4 회귀 PASS) |
-| **4b** | 보드 실행: 플랫폼 설치 → v++ 링크(system.cfg) → XRT 호스트 실기 검증 | 보드/플랫폼 필요 |
+| **4b** | **Windows 네이티브 bitstream** (Vivado 클래식 플로우: HLS IP → BD → synth/impl, `build_vivado.tcl`) + PYNQ 호스트 드라이버 | ✅ (ZCU104 .bit 생성, 200MHz 타이밍 클린) — 실보드 구동만 대기 |
+| **4b-XRT** | (대안) Vitis v++ 링크 + XRT — Linux 호스트 필요 | 보류 |
 | **—** | Q>128 지원(W 타일링), per-vector 스케일(4b) | 향후 |
 
 ### INT4 구성 (Phase 5)
@@ -234,6 +235,21 @@ MAGNet의 대표 기능(4-bit로 성능/면적 개선)을 컴파일 스위치로
 BRAM 절약 원리: rowbuf→URAM(-128 BRAM18), PT_ROWS 4(acc 뱅크가 BRAM36→
 BRAM18, -128). `mapper.py --pes 16 [--int4]`. 매퍼 추정(전체 네트워크):
 16 PE int8 ~28.8 fps, int4 조합 시 2048 MAC/cycle.
+
+### Windows 네이티브 배포 플로우 (Phase 4b, XRT 불필요)
+
+Vitis 가속 플로우(`v++ -l` + XRT)는 Linux 전용이지만, **클래식 Vivado 플로우는
+Windows에서 완결**된다:
+1. HLS csynth → 커널 IP (`build/hls/.../impl/ip`, `run_hls.ps1 synth`)
+2. `hw/scripts/build_vivado.tcl`: ZCU104 보드 프리셋 PS + 커널 + AXI
+   SmartConnect(데이터 7 마스터→HP0, 제어→HPM0) 블록디자인 → synth → impl →
+   `.bit` + `.xsa`. `VIV_BD_ONLY=1`로 BD만 빠르게 검증 가능.
+3. 보드에서 XRT 대신 **PYNQ**(`sw/host/pynq_host.py`)로 s_axilite 레지스터 맵
+   직접 구동 (레지스터 오프셋은 csynth 리포트). conv-only 비트스트림이라 pool/
+   eltwise는 ARM numpy 폴백(hybrid); global_pe_top을 KERNELS에 추가하면 전량 오프로드.
+
+**실측 (xczu7ev, 8 PE, 200MHz)**: BRAM 55.6% / DSP 28.7% / LUT 26.8% /
+URAM 0%, **WNS +0.405ns (타이밍 met), DRC 0 errors**. .bit 19MB, .xsa 3.7MB.
 
 ### 참고 문헌 (resources/)
 - MAGNet: A Modular Accelerator Generator for Neural Networks — ICCAD 2019

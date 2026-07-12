@@ -49,8 +49,12 @@ NVIDIA **MAGNet** (ICCAD 2019) 논문의 모듈형 가속기 템플릿을 AMD Vi
   (per-tensor 11/16 → +3), top-5 16/16. swc 하한(max/256)으로 bias int32
   오버플로 방지. 커널 경로 비트 일치·csim 36/36·csynth 리소스 불변.
   int4 개선은 per-vector 스케일/QAT (향후)
-- ✅ **XRT 호스트/링크 딜리버러블**: `sw/host/xrt_host.cpp` + `hw/scripts/system.cfg`
-  (보드·플랫폼 미보유로 실기 검증은 보류 — Phase 4b)
+- ✅ **Windows 네이티브 bitstream 생성** (Vivado 클래식 플로우, XRT/Linux 불필요):
+  `hw/scripts/build_vivado.tcl` — HLS IP → ZCU104 블록디자인(PS+커널+AXI
+  SmartConnect) → synth/impl → `.bit`+`.xsa`. **실측 xczu7ev 8 PE: BRAM 56%/
+  DSP 29%/LUT 27%, WNS +0.405ns(200MHz 클린), DRC 0 errors**. 보드 구동은
+  `sw/host/pynq_host.py`(PYNQ, s_axilite 레지스터 직접 제어, conv=FPGA·pool/
+  eltwise=ARM hybrid). Vitis/XRT 경로(`xrt_host.cpp`+`system.cfg`)는 Linux용 대안
 - ℹ 제약: Q ≤ 128 (ResNet-50 전 레이어 커버; VGG-224급은 W 타일링 필요),
   KP/CP는 2의 거듭제곱
 - ✅ **Global PE** (`global_pe_top`, 별도 커널): residual add(eltwise, 스케일별
