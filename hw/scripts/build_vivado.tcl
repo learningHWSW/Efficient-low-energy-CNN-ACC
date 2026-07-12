@@ -23,9 +23,18 @@
 # =============================================================================
 
 set REPO   [file normalize [file dirname [info script]]/../..]
-set OUTDIR $REPO/build/vivado
 set BOARD  xilinx.com:zcu104:part0:1.1
-set FREQ   200.0
+
+# Env overrides (default = 8-PE build/hls at 200 MHz -> build/vivado):
+#   MAGNET_IP_DIR  : magnet_top HLS impl/ip dir (e.g. build/hls_zu7final for 16 PE)
+#   MAGNET_FREQ    : PL clock in MHz (lower for timing-tight configs)
+#   MAGNET_OUT     : output subdir + bitstream prefix under build/
+proc envdef {name def} {
+    return [expr {[info exists ::env($name)] ? $::env($name) : $def}]
+}
+set FREQ    [envdef MAGNET_FREQ 200.0]
+set OUTNAME [envdef MAGNET_OUT  vivado]
+set OUTDIR  $REPO/build/$OUTNAME
 
 # Kernels to place in the design. Add global_pe_top for the full network:
 #   set KERNELS {magnet_top global_pe_top}
@@ -33,7 +42,7 @@ set KERNELS {magnet_top}
 
 # IP repository per kernel (HLS impl/ip dirs)
 array set IPREPO [list \
-    magnet_top    $REPO/build/hls/hls/impl/ip \
+    magnet_top    [envdef MAGNET_IP_DIR $REPO/build/hls/hls/impl/ip] \
     global_pe_top $REPO/build/hls_gpe/hls/impl/ip]
 
 file mkdir $OUTDIR

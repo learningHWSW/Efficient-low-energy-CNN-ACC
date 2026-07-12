@@ -268,8 +268,19 @@ Vivado flow completes on Windows**:
    report). The default bitstream is conv-only, so pooling/eltwise fall back to
    the ARM in numpy (hybrid); add global_pe_top to KERNELS to offload them too.
 
-**Measured (xczu7ev, 8 PE, 200 MHz)**: BRAM 55.6% / DSP 28.7% / LUT 26.8% /
-URAM 0%, **WNS +0.405 ns (timing met), DRC 0 errors**. .bit 19 MB, .xsa 3.7 MB.
+`build_vivado.tcl` takes env overrides — `MAGNET_IP_DIR` (kernel IP dir),
+`MAGNET_FREQ` (PL clock MHz), `MAGNET_OUT` (output subdir) — so the same
+script builds the 8-PE or 16-PE bitstream. Both close timing at 200 MHz on the
+ZCU104 (place & route measured):
+
+| Config | LUT | BRAM | URAM | DSP | Post-route WNS |
+|---|---|---|---|---|---|
+| 8 PE (build/hls) | 26.8% | 55.6% | 0% | 28.7% | +0.405 ns |
+| 16 PE (build/hls_zu7final, URAM+PT4) | 42.0% | 68.4% | 16.7% | 51.9% | +0.032 ns |
+
+Both: DRC 0 errors, .bit 19 MB. The 16-PE post-route LUT (42%) is far below the
+csynth estimate (76%) — Vivado packs the fabric int8-packing logic much better
+than HLS estimates. WNS +0.032 ns is tight but met.
 
 ### References (resources/)
 - MAGNet: A Modular Accelerator Generator for Neural Networks — ICCAD 2019

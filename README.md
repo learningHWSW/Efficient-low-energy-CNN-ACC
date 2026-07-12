@@ -34,8 +34,10 @@ hardware remains.
   16/16** (per-channel + percentile calibration).
 - **Windows-native bitstream** — `hw/scripts/build_vivado.tcl` (classic Vivado
   flow, no XRT/Linux): HLS IP → ZCU104 block design → synth/impl → `.bit`+`.xsa`.
-  Measured: **WNS +0.405 ns (200 MHz met), DRC 0 errors**. Board bring-up via
-  `sw/host/pynq_host.py` (PYNQ, drives the s_axilite register map directly).
+  Both configs close timing at 200 MHz on the ZCU104 (post-route): **8 PE — LUT
+  27%, BRAM 56%, WNS +0.405 ns; 16 PE — LUT 42%, BRAM 68%, URAM 17%, DSP 52%,
+  WNS +0.032 ns**, DRC 0 errors. Board bring-up via `sw/host/pynq_host.py`
+  (PYNQ, drives the s_axilite register map directly).
 - **Verified** at every level: bit-exact Python reference model (incl. stream
   deadlock checks), g++ testbenches, Vitis csim, csynth (all MAC loops II=1),
   and RTL cosim (9 runs pass).
