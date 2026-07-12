@@ -124,6 +124,41 @@ python sw\quant\export_resnet50.py              # PTQ export -> sw/quant/export
 
 (For legacy Vitis ≤2024.1, see `hw/scripts/run_hls.tcl`.)
 
+## Using it: image in, class out
+
+The user-facing entry point is `sw/quant/classify.py` — give it an image, it
+preprocesses (resize/crop/normalize), quantizes, runs the quantized ResNet-50,
+and prints the ImageNet class:
+
+```powershell
+python sw\quant\classify.py cat.jpg              # --sim: numpy integer pipeline on a PC
+# 1. Egyptian cat        (logit ...)
+# 2. tabby, tabby cat    (logit ...)
+```
+
+```bash
+sudo python3 sw/quant/classify.py cat.jpg --fpga magnet_top.bit   # on the board
+```
+
+Both backends share the exact same preprocessing, quantization, and label
+lookup. The `--sim` integer pipeline is **bit-identical to what the FPGA
+computes** (verified: kernel-path logits match `--sim` 0/1000 on a real image),
+so running `--sim` on a PC predicts the FPGA result — only the hardware MMIO is
+board-only. End-to-end operation on the board:
+
+```
+image.jpg
+  → [ARM] preprocess + int8 quantize (input scale from manifest.json)
+  → [FPGA] conv layers (magnet_top driven via s_axilite register map)
+  → [ARM] pooling / residual add (conv-only bitstream; numpy fallback)
+  → [ARM] argmax + labels.txt → class name
+```
+
+Prerequisite: an export directory from `export_resnet50.py` (weights + manifest
++ `labels.txt`). Note int8 logits saturate at ±127, so several top classes can
+tie at the cap — a larger-precision final layer would sharpen top-1 (a future
+refinement); the ranking is otherwise correct.
+
 ## Design summary
 
 Three-tier compute hierarchy from MAGNet: a **Vector MAC** (VECTOR_SIZE-wide

@@ -333,8 +333,8 @@ def write_export(qgraph, scale, meta, outdir, vec, bits):
         elif L["op"] == "maxpool":
             e.update(R=L["R"], S=L["S"], stride=L["stride"], pad=L["pad"])
         elif L["op"] == "eltwise":
-            e.update(multA=L["multA"], multB=L["multB"], shift=L["shift"],
-                     relu=L["relu"])
+            e.update(src2=L["src2"], multA=L["multA"], multB=L["multB"],
+                     shift=L["shift"], relu=L["relu"])
         elif L["op"] == "gavgpool":
             e.update(multA=L.get("multA", 0), shift=L["shift"])
         layers.append(e)
@@ -510,6 +510,9 @@ def main():
                     for f in os.listdir(args.images)) else "synthetic")
     manifest = write_export(qgraph, scale, meta, args.out, vec, bits)
     write_test_vectors(args.out, *tv)
+    # ImageNet class names (index -> label) for the classifier front-end
+    with open(os.path.join(args.out, "labels.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(cats))
     total = sum(os.path.getsize(os.path.join(args.out, f))
                 for f in os.listdir(args.out))
     print(f"export: {len(manifest['layers'])} layers -> {args.out} "
