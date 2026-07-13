@@ -99,6 +99,8 @@ def main():
                     metavar=("LO", "HI"))
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--stem-bits", type=int, default=None,
+                    help="stem-conv precision to match a mixed-precision QAT")
     ap.add_argument("--exclude-train-limit", type=int, default=None,
                     help="reconstruct qat train set (image_paths limit/seed 0) "
                          "and exclude it -> strictly held-out eval")
@@ -123,14 +125,14 @@ def main():
     print(f"FP32       top-1 {a1*100:5.1f}%  top-5 {a5*100:5.1f}%")
 
     ptq = quantize_model(torchvision.models.resnet50(weights=w),
-                         args.bits).to(dev)
+                         args.bits, args.stem_bits).to(dev)
     calibrate(ptq, paths, dev, args.batch)
     a1, a5, _ = top1_top5(ptq, paths, labels, dev, args.batch)
     print(f"int{args.bits} PTQ   top-1 {a1*100:5.1f}%  top-5 {a5*100:5.1f}%")
 
     if args.qat and os.path.exists(args.qat):
         qat = quantize_model(torchvision.models.resnet50(weights=w),
-                             args.bits).to(dev)
+                             args.bits, args.stem_bits).to(dev)
         sd = torch.load(args.qat, map_location=dev, weights_only=True)
         qat.load_state_dict(sd)
         a1, a5, _ = top1_top5(qat, paths, labels, dev, args.batch)

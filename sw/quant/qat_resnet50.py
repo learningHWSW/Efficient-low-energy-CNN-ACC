@@ -21,6 +21,7 @@
 # =============================================================================
 
 import argparse
+import math
 import os
 
 import numpy as np
@@ -34,58 +35,70 @@ import torchvision
 # fake-quant (straight-through estimator), matching the accelerator's integer
 # quantization: symmetric, round-to-nearest, clamp to [qmin, qmax]
 # ---------------------------------------------------------------------------
-def _ste_round(x):
-    return x + (torch.round(x) - x).detach()
+def _round_ste(x):
+    return (torch.round(x) - x).detach() + x
 
 
-def fake_quant(x, scale, qmin, qmax):
-    q = torch.clamp(_ste_round(x / scale), qmin, qmax)
-    return q * scale
+def _grad_scale(x, g):
+    # pass-through value, scale the gradient by g (LSQ, Esser et al. 2020)
+    return (x - x * g).detach() + x * g
+
+
+def lsq_quant(v, scale, qmin, qmax, n):
+    """Learned-step-size quantization: `scale` is a learnable parameter, its
+    gradient scaled by 1/sqrt(n*qmax) for stable low-bit training."""
+    s = scale.abs() + 1e-8
+    s = _grad_scale(s, 1.0 / math.sqrt(max(1, n) * qmax))
+    q = _round_ste(torch.clamp(v / s, qmin, qmax))
+    return q * s
 
 
 class QConv2d(nn.Module):
-    """Conv2d with per-output-channel fake-quant weights and per-tensor
-    fake-quant inputs, mirroring magnet_top's integer datapath."""
+    """Conv2d with LSQ fake-quant: learnable per-output-channel weight scale
+    and a learnable per-tensor activation scale, mirroring the accelerator's
+    integer datapath. Per-instance `bits` allows mixed precision (int8 stem)."""
 
     def __init__(self, conv, bits):
         super().__init__()
         self.conv = conv
+        self.bits = bits
         self.qmax = (1 << (bits - 1)) - 1
         self.qmin = -(1 << (bits - 1))
-        # per-tensor input activation scale, calibrated then fine-tuned (LSQ)
-        self.act_scale = nn.Parameter(torch.ones(1))
-        self.act_calibrated = False
-
-    def calibrate_act(self, x, pct=99.99):
-        v = x.detach().abs().flatten().float()
-        if v.numel() > 200000:                     # subsample: quantile sorts
-            idx = torch.randint(0, v.numel(), (200000,), device=v.device)
-            v = v[idx]
-        a = torch.quantile(v, torch.tensor(pct / 100.0, device=v.device))
-        self.act_scale.data.fill_(float(a) / self.qmax + 1e-8)
-        self.act_calibrated = True
+        K = conv.weight.shape[0]
+        # weight scale (per output channel), init from max — learnable (LSQ)
+        sw = conv.weight.detach().abs().amax(dim=(1, 2, 3), keepdim=True)
+        self.w_scale = nn.Parameter(sw / self.qmax + 1e-8)
+        self.a_scale = nn.Parameter(torch.ones(1))
+        self.a_ready = False
 
     def forward(self, x):
-        if not self.act_calibrated:
-            self.calibrate_act(x)
-        xq = fake_quant(x, self.act_scale.abs(), self.qmin, self.qmax)
+        if not self.a_ready:                        # one-shot activation calib
+            v = x.detach().abs().flatten().float()
+            if v.numel() > 200000:
+                v = v[torch.randint(0, v.numel(), (200000,), device=v.device)]
+            a = torch.quantile(v, torch.tensor(0.9999, device=v.device))
+            self.a_scale.data.fill_(float(a) / self.qmax + 1e-8)
+            self.a_ready = True
+        xq = lsq_quant(x, self.a_scale, self.qmin, self.qmax, x[0].numel())
         w = self.conv.weight
-        # per-output-channel symmetric weight scale from the current weights
-        sw = w.abs().amax(dim=(1, 2, 3), keepdim=True) / self.qmax + 1e-8
-        wq = fake_quant(w, sw, self.qmin, self.qmax)
+        wq = lsq_quant(w, self.w_scale, self.qmin, self.qmax,
+                       w[0].numel())
         return F.conv2d(xq, wq, self.conv.bias, self.conv.stride,
                         self.conv.padding, self.conv.dilation,
                         self.conv.groups)
 
 
-def quantize_model(model, bits):
-    """Replace every Conv2d (except the 3-channel stem, kept higher fidelity
-    is optional — here we quantize all) with a QConv2d."""
+def quantize_model(model, bits, stem_bits=None):
+    """Wrap every Conv2d in a QConv2d at `bits`. The stem conv (in_channels==3)
+    uses `stem_bits` if given (int8 stem is standard for usable int4); the
+    final fc (Linear) is left in FP. Both sensitive layers can run at higher
+    precision on the ARM / a small int8 pass at deploy time."""
     for name, m in model.named_children():
         if isinstance(m, nn.Conv2d):
-            setattr(model, name, QConv2d(m, bits))
+            b = stem_bits if (stem_bits and m.in_channels == 3) else bits
+            setattr(model, name, QConv2d(m, b))
         else:
-            quantize_model(m, bits)
+            quantize_model(m, bits, stem_bits)
     return model
 
 
@@ -149,6 +162,9 @@ def main():
                     help="cap number of training images (subsampled evenly)")
     ap.add_argument("--eval-every", type=int, default=1,
                     help="report teacher/student agreement every N epochs")
+    ap.add_argument("--stem-bits", type=int, default=None,
+                    help="precision for the 3-channel stem conv (e.g. 8); "
+                         "int8 stem is standard for usable int4")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny CPU run: 16 images, 8 steps, wiring/loss check")
     args = ap.parse_args()
@@ -163,7 +179,10 @@ def main():
         p.requires_grad_(False)
 
     student = torchvision.models.resnet50(weights=w)
-    student = quantize_model(student, args.bits).to(dev)
+    student = quantize_model(student, args.bits, args.stem_bits).to(dev)
+    if args.stem_bits:
+        print(f"mixed precision: stem conv int{args.stem_bits}, "
+              f"rest int{args.bits}, fc FP")
 
     all_paths = image_paths(args.data, limit=16 if args.smoke else args.limit)
     if len(all_paths) < 8:
@@ -203,6 +222,8 @@ def main():
 
     opt = torch.optim.Adam([p for p in student.parameters()
                             if p.requires_grad], lr=args.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, epochs * len(loader)))
     student.train()
     T = args.temp
     step = 0
@@ -219,6 +240,7 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
+            sched.step()
             losses.append(loss.item())
             step += 1
             if step >= max_steps:

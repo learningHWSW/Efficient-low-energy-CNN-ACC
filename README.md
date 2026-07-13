@@ -23,29 +23,30 @@ hardware remains.
   (row buffers → URAM + `PT_ROWS=4`): BRAM 85% / URAM 16% / DSP 52% / LUT 76%,
   all MAC loops II=1, no performance loss (~28.8 fps est.). Alternatives:
   xcku5p (free, no ARM PS) or zu9eg/ZCU102 (roomy, Enterprise license).
-- **INT4 configuration** (`-DUSE_INT4`): W/IA/OA 4-bit + VECTOR_SIZE 16 →
-  **1024 MAC/cycle = 409.6 GOPS** per 8 PEs, with *fewer* DSPs than int8
-  (small multiplies map to fabric). int8 and int4 both regress clean. **int4
-  accuracy** needs QAT, not PTQ: per-channel/per-vector PTQ leaves int4 at
-  top-1 0/16 (activation resolution is the bottleneck — shown by
-  `sw/quant/vsq_probe.py`), while label-free distillation QAT
-  (`sw/quant/qat_resnet50.py`, fake-quant matched to the datapath) recovers it.
-  Distilled on the ImageNet-1k validation set (`fetch_imagenet_val.py`, 40k
-  images across all 1000 classes, 5 epochs on an RTX 5060 / CUDA 12.8) with no
-  labels, then measured with `eval_imagenet.py` on 8,910 strictly held-out
-  images (training images excluded):
+- **INT8 vs INT4** — int8 (`-DUSE_INT4` off) is essentially lossless with plain
+  PTQ; int4 (`-DUSE_INT4`, 1024 MAC/cycle = 409.6 GOPS, *fewer* DSPs than int8)
+  doubles throughput but trades accuracy and needs QAT. Real ImageNet-1k top-1
+  on 8,910 strictly held-out images (all 1000 classes, training images excluded;
+  `eval_imagenet.py`):
 
-  | model | top-1 | top-5 |
-  |---|---|---|
-  | FP32 | 75.9% | 93.2% |
-  | int4 PTQ | 14.3% | 30.2% |
-  | **int4 QAT** | **44.0%** | 70.3% |
+  | model | top-1 | top-5 | notes |
+  |---|---|---|---|
+  | FP32 | 75.9% | 93.2% | reference |
+  | **int8 PTQ** | **76.1%** | 93.1% | lossless, no QAT needed |
+  | int4 PTQ (all int4) | 14.3% | 30.2% | unusable |
+  | int4 PTQ (int8 stem) | 42.0% | 66.7% | int8 stem is the biggest single lever |
+  | int4 QAT (basic) | 44.0% | 70.3% | plain fake-quant, val-only distill |
+  | **int4 QAT (LSQ + int8 stem)** | **56.2%** | 79.7% | learned scales + mixed precision |
 
-  QAT lifts int4 top-1 3x (14%→44%). It stays below FP because this is val-only
-  distillation for a few epochs (real QAT uses the 1.2M-image train set with
-  labels for many epochs, reaching ~74%), and the QAT model keeps the final
-  fc/biases in FP (the FPGA runs fc as int4, so deployment runs fc
-  higher-precision on the ARM or quantizes it in QAT).
+  Path to int4: PTQ leaves it at top-1 0/16 (activation resolution is the
+  bottleneck — `vsq_probe.py` shows per-vector weight scaling alone doesn't fix
+  it). Label-free distillation QAT (`qat_resnet50.py`, fake-quant matched to the
+  datapath, teacher = FP ResNet-50) plus **LSQ** (learned step sizes) and a
+  **mixed-precision int8 stem** lifts int4 to 56.2% top-1 (80% top-5). Trained on
+  the ImageNet-1k val set (`fetch_imagenet_val.py`, 40k images, 6 epochs) on an
+  RTX 5060 (CUDA 12.8). Still below int8 because this is val-only distillation
+  for a few epochs and keeps the final fc in FP; proper QAT on the 1.2M-image
+  train set reaches ~74%.
 - **Real-weight pipeline** — `sw/quant/export_resnet50.py` (pretrained ResNet-50
   → BN folding → per-channel PTQ → accelerator layout). The **full 224×224
   ResNet-50 (72 layers incl. fc)** runs through the kernels bit-exactly against
