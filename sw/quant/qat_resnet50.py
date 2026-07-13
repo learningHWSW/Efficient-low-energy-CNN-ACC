@@ -117,8 +117,8 @@ def load_batch(paths):
     return torch.stack([ImageSet(paths)[i] for i in range(len(paths))])
 
 
-def image_paths(d, limit=None):
-    # recurse (fruits262 stores images in per-class subdirs)
+def image_paths(d, limit=None, seed=0):
+    # recurse (datasets store images in per-class subdirs)
     fs = []
     for root, _dirs, files in os.walk(d):
         for f in files:
@@ -126,9 +126,11 @@ def image_paths(d, limit=None):
                 fs.append(os.path.join(root, f))
     fs.sort()
     if limit and len(fs) > limit:
-        # evenly spaced subsample across the (class-sorted) list for diversity
-        step = len(fs) // limit
-        fs = fs[::step][:limit]
+        # RANDOM subsample across the whole (class-sorted) list so every class
+        # is represented — a strided/prefix cut would miss whole classes
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(len(fs), limit, replace=False))
+        fs = [fs[i] for i in idx]
     return fs
 
 

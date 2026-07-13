@@ -30,12 +30,22 @@ hardware remains.
   top-1 0/16 (activation resolution is the bottleneck — shown by
   `sw/quant/vsq_probe.py`), while label-free distillation QAT
   (`sw/quant/qat_resnet50.py`, fake-quant matched to the datapath) recovers it.
-  Distilled on the ImageNet-1k validation set (`fetch_imagenet_val.py`, 30k
-  images, 4 epochs on an RTX 5060 / CUDA 12.8), held-out teacher-agreement over
-  a class-diverse split rises 30% to 73% with loss falling 2.66 to 1.46 — a
-  strong int4 recovery vs PTQ's near-zero. (Agreement is a quantization-fidelity
-  proxy; this QAT model keeps the final fc/biases in FP, so hardware deployment
-  runs the fc higher-precision on the ARM or quantizes it in QAT.)
+  Distilled on the ImageNet-1k validation set (`fetch_imagenet_val.py`, 40k
+  images across all 1000 classes, 5 epochs on an RTX 5060 / CUDA 12.8) with no
+  labels, then measured with `eval_imagenet.py` on 8,910 strictly held-out
+  images (training images excluded):
+
+  | model | top-1 | top-5 |
+  |---|---|---|
+  | FP32 | 75.9% | 93.2% |
+  | int4 PTQ | 14.3% | 30.2% |
+  | **int4 QAT** | **44.0%** | 70.3% |
+
+  QAT lifts int4 top-1 3x (14%→44%). It stays below FP because this is val-only
+  distillation for a few epochs (real QAT uses the 1.2M-image train set with
+  labels for many epochs, reaching ~74%), and the QAT model keeps the final
+  fc/biases in FP (the FPGA runs fc as int4, so deployment runs fc
+  higher-precision on the ARM or quantizes it in QAT).
 - **Real-weight pipeline** — `sw/quant/export_resnet50.py` (pretrained ResNet-50
   → BN folding → per-channel PTQ → accelerator layout). The **full 224×224
   ResNet-50 (72 layers incl. fc)** runs through the kernels bit-exactly against
@@ -76,6 +86,7 @@ sw/
   quant/classify.py         # image -> ImageNet class (sim or FPGA backend)
   quant/qat_resnet50.py     # int4 quantization-aware training (distillation, no labels)
   quant/fetch_imagenet_val.py # download ImageNet-1k val (kagglehub) for QAT distillation
+  quant/eval_imagenet.py    # real ImageNet top-1/top-5: FP vs int4 PTQ vs int4 QAT
   quant/vsq_probe.py        # per-vector-scale experiment (why int4 needs QAT)
   quant/fetch_calib_images.py # sample fruits262 calibration images via kagglehub
   mapper/mapper.py          # MAGNet Mapper (spatial/tile selection + cycle/traffic model)
